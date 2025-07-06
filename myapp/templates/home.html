@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Repository Explainer</title>
+</head>
+<body>
+    <h1>Repository Explainer</h1>
+    <form method="post">
+        {% csrf_token %}
+        <input type="text" name="repo_url" placeholder="Enter GitHub Repository URL" required>
+        <button type="submit">Explain Repository</button>
+    </form>
+    {% if explanation %}
+        <h2>Explanation:</h2>
+        <p>{{ explanation }}</p>
+    {% endif %}
+</body>
+</html>
