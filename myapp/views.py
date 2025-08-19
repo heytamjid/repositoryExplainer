@@ -2,6 +2,7 @@ import os
 import requests
 import base64
 import re
+import json
 from urllib.parse import urlparse
 from collections import defaultdict
 import time
@@ -14,8 +15,7 @@ import markdown2
 
 # --- Configuration & Constants ---
 
-# Using environment variables is a good practice for API keys.
-# Ensure GOOGLE_API_KEY and GITHUB_TOKEN are set in your environment.
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
@@ -23,14 +23,32 @@ LLM_MODEL_NAME = "gemini-2.5-flash"
 LLM_TEMPERATURE_IDENTIFY = 0.1
 LLM_TEMPERATURE_GENERATE = 0.4
 
-CATEGORIES = [
-    "Purpose & Scope",
-    "System Architecture Overview",
-    "Core Components (Implementation Details)",
-    "Data Model",
+# Sections are now modular and configurable. Each section has a stable id, a human title and a short description.
+SECTION_DEFINITIONS = [
+    {
+        "id": "purpose_scope",
+        "title": "Purpose & Scope",
+        "description": "README, high-level documentation, and files that describe why the project exists and what it does.",
+    },
+    {
+        "id": "system_architecture",
+        "title": "System Architecture Overview",
+        "description": "Configuration files, server entrypoints, routing, and high-level architecture information.",
+    },
+    {
+        "id": "core_components",
+        "title": "Core Components (Implementation Details)",
+        "description": "Primary source code modules and packages implementing the main features.",
+    },
+    {
+        "id": "data_model",
+        "title": "Data Model",
+        "description": "ORM models, schemas, and database interaction layers.",
+    },
 ]
 
-MAX_TOTAL_CONTEXT_CHARS = 30000
+# Backwards-compatible constant for max context
+MAX_TOTAL_CONTEXT_CHARS = 50000
 
 # --- GitHub API Functions ---
 
@@ -99,42 +117,44 @@ def get_file_content(repo_url: str, relative_file_path: str) -> str | None:
 # --- LLM Interaction Functions ---
 
 
-def get_important_files_by_category(repo_tree):
-    print("Identifying important files by category...")
+def get_important_files_by_category(repo_tree, sections=SECTION_DEFINITIONS):
+    """Identify important files per section. The LLM is instructed to return a strict JSON object
+    mapping section ids to a list of file paths. This function validates and falls back to a
+    best-effort bullet-parsing if JSON cannot be parsed.
+    """
+    print("Identifying important files by category (structured JSON expected)...")
     if not repo_tree:
-        return {}
+        return {s["id"]: [] for s in sections}
 
     file_list_str = "\n".join([item["path"] for item in repo_tree])
 
-    prompt_template_files = """
-You are an expert software architect analyzing a GitHub repository's file structure.
-Your goal is to identify the *most important and relevant* files for understanding each of the following categories.
+    # Build a JSON description of the sections to pass to the LLM so keys are explicit and stable
+    sections_payload = [
+        {"id": s["id"], "title": s["title"], "description": s.get("description", "")}
+        for s in sections
+    ]
 
+    prompt_template_files = """
+You are an expert software architect. Given a repository file list, return a JSON object that maps
+section IDs to an array of the most relevant file paths for that section.
+
+Important rules:
+- Output MUST be valid JSON and only the JSON object (no surrounding explanation).
+- Keys must be the section ids provided in the `sections` input.
+- Values must be arrays of strings with relative file paths (or an empty array if none).
+
+Input:
+Sections: {sections}
 Repository File List:
 {file_list}
 
-Based on the file paths, list the most relevant file paths for each category below.
-Prioritize files that likely contain defining information.
-
-Categories:
-1.  **Purpose & Scope**: (README, high-level documentation, main application files)
-2.  **System Architecture Overview**: (Configuration files, main application/server files, routing files, docker-compose.yml)
-3.  **Core Components (Implementation Details)**: (Source code directories like 'src/', 'lib/', 'app/', key modules)
-4.  **Data Model**: (Files named 'models.py', 'schemas.py', database interaction layers, ORM definitions)
-
-Provide your answer *strictly* in the following format, listing the file paths under each category heading.
-
-**Purpose & Scope:**
-- path/to/relevant/file1.ext
-
-**System Architecture Overview:**
-- path/to/relevant/file2.ext
-
-**Core Components (Implementation Details):**
-- path/to/core/logic.py
-
-**Data Model:**
-- path/to/models.py
+Example expected output format:
+{{
+  "purpose_scope": ["README.md", "docs/overview.md"],
+  "system_architecture": ["docker-compose.yml", "deploy/prod.yaml"],
+  "core_components": ["src/main.py"],
+  "data_model": ["models.py"]
+}}
 """
     try:
         llm_identify = ChatGoogleGenerativeAI(
@@ -146,50 +166,69 @@ Provide your answer *strictly* in the following format, listing the file paths u
             prompt_template_files
         )
         chain_identify = file_identification_prompt | llm_identify | StrOutputParser()
-        print("Invoking LLM to identify important files...")
-        llm_response_files = chain_identify.invoke({"file_list": file_list_str})
+        print("Invoking LLM to identify important files (JSON expected)...")
+        raw_response = chain_identify.invoke(
+            {"file_list": file_list_str, "sections": json.dumps(sections_payload)}
+        )
 
-        identified_files_by_category = {category: [] for category in CATEGORIES}
-        current_category_key = None
-        category_header_map = {
-            "**Purpose & Scope:**": "Purpose & Scope",
-            "**System Architecture Overview:**": "System Architecture Overview",
-            "**Core Components (Implementation Details):**": "Core Components (Implementation Details)",
-            "**Data Model:**": "Data Model",
-        }
+        # Try to parse returned JSON strictly. If that fails, attempt to extract the first JSON object.
+        identified = None
+        try:
+            identified = json.loads(raw_response)
+        except Exception:
+            # Attempt to extract a JSON substring
+            match = re.search(r"\{(?:.|\n)*\}", raw_response)
+            if match:
+                try:
+                    identified = json.loads(match.group(0))
+                except Exception:
+                    identified = None
 
-        for line in llm_response_files.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            is_header = False
-            for header, key in category_header_map.items():
-                if line.startswith(header):
-                    current_category_key = key
-                    is_header = True
-                    break
-            if not is_header and current_category_key and line.startswith("-"):
-                file_path = line[1:].strip()
-                if file_path:
-                    identified_files_by_category[current_category_key].append(file_path)
-        print("Successfully identified files.")
-        return identified_files_by_category
+        # Validate and normalize result into a mapping from section id -> list[str]
+        result = {s["id"]: [] for s in sections}
+        if isinstance(identified, dict):
+            for sid, val in identified.items():
+                if sid in result and isinstance(val, list):
+                    result[sid] = [p for p in val if isinstance(p, str) and p.strip()]
+        else:
+            # Fall back to older bullet-parsing if JSON not provided: best-effort
+            print(
+                "LLM did not return valid JSON; attempting fallback parsing of bullets."
+            )
+            current_key = None
+            # Map titles to ids for fallback detection
+            title_to_id = {s["title"]: s["id"] for s in sections}
+            for line in raw_response.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # header detection
+                if line in title_to_id:
+                    current_key = title_to_id[line]
+                    continue
+                if line.startswith("-") and current_key:
+                    p = line[1:].strip()
+                    if p:
+                        result[current_key].append(p)
+        print("Successfully identified files (structured).")
+        return result
     except Exception as e:
         print(f"Error during file identification: {e}")
-        return {}
+        return {s["id"]: [] for s in sections}
 
 
-def generate_documentation(repo_url, files_by_category):
-    print("Generating documentation...")
+def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINITIONS):
+    """Generate documentation. files_by_category is expected to be a dict mapping section id -> list of file paths."""
+    print("Generating documentation (using structured sections)...")
     generated_documentation = {}
+
+    # Flatten all files
     all_files = set()
     for files in files_by_category.values():
         all_files.update(files)
 
     if not all_files:
-        return {
-            category: "No relevant files were identified." for category in CATEGORIES
-        }
+        return {s["id"]: "No relevant files were identified." for s in sections}
 
     context_str = ""
     current_total_chars = 0
@@ -209,8 +248,8 @@ def generate_documentation(repo_url, files_by_category):
 
     if not context_str:
         return {
-            category: "Failed to retrieve content for the identified files."
-            for category in CATEGORIES
+            s["id"]: "Failed to retrieve content for the identified files."
+            for s in sections
         }
 
     try:
@@ -221,12 +260,20 @@ def generate_documentation(repo_url, files_by_category):
         )
         output_parser = StrOutputParser()
 
+        # Use the modular sections when instructing the model
+        sections_desc = "\n".join(
+            [
+                f"- {s['id']}: {s['title']} -- {s.get('description','')}"
+                for s in sections
+            ]
+        )
+
         system_prompt_content_generation = """
 You are an expert technical writer. Your task is to generate clear, concise documentation for a GitHub repository based *only* on the provided code snippets.
-- For each category provided, write a detailed explanation based on the context.
-- If the context is insufficient for a category, state that clearly. Do not invent information.
+- For each section provided, write a clear explanation based only on the context.
+- If the context is insufficient for a section, state that clearly. Do not invent information.
 - Structure your entire response in Markdown.
-- Use the category titles as Level 2 Markdown headers (e.g., `## Purpose & Scope`).
+- Use the section TITLE as a Level 2 Markdown header (e.g., `## Purpose & Scope`).
 """
         prompt_template_generate = ChatPromptTemplate.from_messages(
             [
@@ -234,13 +281,13 @@ You are an expert technical writer. Your task is to generate clear, concise docu
                 (
                     "human",
                     """
-            Based *only* on the following context (code snippets from relevant files), generate documentation for all the following categories:
-            {categories}
+            Based *only* on the following context (code snippets from relevant files), generate documentation for all the following sections:
+            {sections}
 
             Context:
             {context}
             ---
-            Task: Provide a detailed explanation for each category. Structure your response with each category as a markdown header.
+            Task: Provide a detailed explanation for each section. Structure your response with each section as a markdown header.
             """,
                 ),
             ]
@@ -249,26 +296,26 @@ You are an expert technical writer. Your task is to generate clear, concise docu
 
         print("Invoking LLM to generate documentation...")
         all_docs_str = chain_generate.invoke(
-            {"context": context_str, "categories": "\n".join(CATEGORIES)}
+            {"context": context_str, "sections": sections_desc}
         )
 
-        # Parse the combined response
-        for category in CATEGORIES:
-            # Use regex to find the content for each category
-            pattern = f"## {re.escape(category)}(.*?)(\n## |$)"
+        # Parse the combined response per section title
+        for s in sections:
+            title = s["title"]
+            pattern = f"## {re.escape(title)}(.*?)(\n## |$)"
             match = re.search(pattern, all_docs_str, re.DOTALL | re.IGNORECASE)
             if match:
                 content = match.group(1).strip()
-                generated_documentation[category] = markdown2.markdown(content)
+                generated_documentation[s["id"]] = markdown2.markdown(content)
             else:
-                generated_documentation[category] = (
-                    "Could not generate documentation for this category."
+                generated_documentation[s["id"]] = (
+                    "Could not generate documentation for this section."
                 )
         print("Successfully generated documentation.")
         return generated_documentation
     except Exception as e:
         print(f"Error during documentation generation: {e}")
-        return {category: "Error during generation." for category in files_by_category}
+        return {s["id"]: "Error during generation." for s in sections}
 
 
 # --- Django View ---
@@ -289,21 +336,29 @@ def home(request):
                 repo_tree = fetch_repo_tree(repo_url)
                 if repo_tree:
                     print("Step 2: Identifying important files.")
-                    files_by_category = get_important_files_by_category(repo_tree)
+                    files_by_category = get_important_files_by_category(
+                        repo_tree, SECTION_DEFINITIONS
+                    )
                     if files_by_category:
                         print("Waiting for 5 seconds to avoid rate limiting...")
                         time.sleep(5)
                         print("Step 3: Generating documentation.")
                         documentation = generate_documentation(
-                            repo_url, files_by_category
+                            repo_url, files_by_category, SECTION_DEFINITIONS
                         )
                     else:
                         error = "Could not identify important files in the repository."
                 else:
                     error = "Could not fetch the repository file structure. Please check the URL and repository permissions."
 
+    # Render output with documentation keyed by section id. The template can map ids to titles using SECTION_DEFINITIONS if needed.
     return render(
         request,
         "home.html",
-        {"documentation": documentation, "error": error, "repo_url": repo_url},
+        {
+            "documentation": documentation,
+            "error": error,
+            "repo_url": repo_url,
+            "sections": SECTION_DEFINITIONS,
+        },
     )
