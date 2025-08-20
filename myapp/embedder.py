@@ -21,22 +21,53 @@ EMBEDDING_BATCH_SIZE = 100
 EMBEDDING_DIMENSIONS = 768
 
 # --- Module-level State Management ---
-_indexing_state: Dict[str, str] = {}
-_indexing_start_times: Dict[str, float] = {}
+STATUS_FILE_NAME = "indexing_status.json"
 _index_lock = threading.Lock()
 
 
-def clear_indexing_state(repo_url: str = None):
-    """Clear indexing state for a specific repo or all repos if none specified."""
+def _get_status_path(persist_dir: str) -> Path:
+    """Gets the path to the persistent status file."""
+    return Path(persist_dir) / STATUS_FILE_NAME
+
+
+def _read_status(status_path: Path) -> Dict:
+    """Reads the indexing status from the persistent file."""
+    if not status_path.exists():
+        return {}
+    try:
+        with status_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _write_status(status_path: Path, data: Dict):
+    """Writes the indexing status to the persistent file."""
     with _index_lock:
-        if repo_url:
-            _indexing_state.pop(repo_url, None)
-            _indexing_start_times.pop(repo_url, None)
+        status_path.parent.mkdir(exist_ok=True)
+        with status_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+
+def clear_indexing_state(repo_url: str = None, persist_dir: str = "chroma_persist"):
+    """Clear indexing state for a specific repo or all repos if none specified."""
+    status_path = _get_status_path(persist_dir)
+    statuses = _read_status(status_path)
+    if repo_url:
+        if repo_url in statuses:
+            del statuses[repo_url]
             print(f"Cleared indexing state for {repo_url}")
-        else:
-            _indexing_state.clear()
-            _indexing_start_times.clear()
-            print("Cleared all indexing states")
+    else:
+        statuses.clear()
+        print("Cleared all indexing states")
+    _write_status(status_path, statuses)
+
+
+def get_indexing_status(repo_url: str, persist_dir: str = "chroma_persist") -> Dict:
+    """Gets the indexing status for a specific repository."""
+    status_path = _get_status_path(persist_dir)
+    statuses = _read_status(status_path)
+    return statuses.get(repo_url, {"status": "not_indexed"})
 
 
 def _read_gitignore(repo_path: Path) -> Optional[pathspec.PathSpec]:
@@ -190,69 +221,93 @@ def index_repository(
     collection_name: str = "repo_functions",
 ) -> Dict:
     """Clones a repo, extracts code units, embeds them, and persists to ChromaDB."""
-    with _index_lock:
-        if _indexing_state.get(repo_url) == "running":
-            start_time = _indexing_start_times.get(repo_url)
-            if start_time and time.time() - start_time > 600:
-                print(f"Indexing for {repo_url} timed out, resetting state")
-                _indexing_state.pop(repo_url, None)
-                _indexing_start_times.pop(repo_url, None)
-            else:
-                return {"status": "already_running"}
-        _indexing_state[repo_url] = "running"
-        _indexing_start_times[repo_url] = time.time()
+    status_path = _get_status_path(persist_dir)
+    statuses = _read_status(status_path)
+    repo_status = statuses.get(repo_url, {})
+
+    if repo_status.get("status") == "done":
+        print(f"Repository {repo_url} already indexed. Skipping.")
+        return {"status": "already_indexed", "commit": repo_status.get("commit")}
+
+    if repo_status.get("status") == "running":
+        start_time = repo_status.get("start_time")
+        if start_time and time.time() - start_time > 600:  # 10-minute timeout
+            print(f"Indexing for {repo_url} timed out. Resetting.")
+        else:
+            return {"status": "already_running"}
+
+    # Set status to running
+    statuses[repo_url] = {"status": "running", "start_time": time.time()}
+    _write_status(status_path, statuses)
+
+    # Clean up previous failed attempts for this repo
+    try:
+        client = chromadb.PersistentClient(path=persist_dir)
+        collection = client.get_or_create_collection(collection_name)
+        collection.delete(where={"repo_url": repo_url})
+        print(f"Cleared previous entries for {repo_url} before re-indexing.")
+    except Exception as e:
+        print(f"Could not clear old entries for {repo_url}: {e}")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="repo_index_"))
     try:
         commit = _clone_repo(repo_url, tmpdir)
         if not commit:
-            return {"status": "clone_failed"}
+            raise Exception("Failed to clone repository.")
 
         spec = _read_gitignore(tmpdir)
-        client = chromadb.PersistentClient(path=persist_dir)
-        collection = client.get_or_create_collection(collection_name)
 
         texts_to_embed, metadata_for_text = [], []
 
-        print("Walking repository files...")
-        for root, _, files in os.walk(tmpdir):
-            rootp = Path(root)
-            if ".git" in rootp.parts:
-                continue
-            for fn in files:
-                fp = rootp / fn
-                if _is_ignored(fp, tmpdir, spec):
+        # Create a temporary file for logging what's being embedded
+        log_file_path = tmpdir / "embedding_log.txt"
+        with log_file_path.open("w", encoding="utf-8") as log_f:
+            print("Walking repository files...")
+            for root, _, files in os.walk(tmpdir):
+                rootp = Path(root)
+                if ".git" in rootp.parts:
                     continue
+                for fn in files:
+                    fp = rootp / fn
+                    if _is_ignored(fp, tmpdir, spec):
+                        continue
 
-                units = (
-                    _extract_python_units(fp)
-                    if fp.suffix == ".py"
-                    else [_fallback_file_unit(fp)]
-                )
-                if not units:
-                    units = [_fallback_file_unit(fp)]
+                    units = (
+                        _extract_python_units(fp)
+                        if fp.suffix == ".py"
+                        else [_fallback_file_unit(fp)]
+                    )
+                    if not units:
+                        units = [_fallback_file_unit(fp)]
 
-                for u in units:
-                    chunks = _chunk_text(u["code"])
-                    for idx, ch in enumerate(chunks):
-                        doc = f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n```\n{ch}\n```"
-                        texts_to_embed.append(doc)
-                        metadata_for_text.append(
-                            {
-                                "repo_url": repo_url,
-                                "commit": commit,
-                                "file_path": str(fp.relative_to(tmpdir)).replace(
-                                    "\\", "/"
-                                ),
-                                "unit_name": u["name"],
-                                "unit_type": u["type"],
-                                "start_line": u["start_line"],
-                                "end_line": u["end_line"],
-                                "chunk_index": idx,
-                            }
-                        )
+                    for u in units:
+                        chunks = _chunk_text(u["code"])
+                        for idx, ch in enumerate(chunks):
+                            doc = f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n```\n{ch}\n```"
+                            texts_to_embed.append(doc)
+                            metadata_for_text.append(
+                                {
+                                    "repo_url": repo_url,
+                                    "commit": commit,
+                                    "file_path": str(fp.relative_to(tmpdir)).replace(
+                                        "\\", "/"
+                                    ),
+                                    "unit_name": u["name"],
+                                    "unit_type": u["type"],
+                                    "start_line": u["start_line"],
+                                    "end_line": u["end_line"],
+                                    "chunk_index": idx,
+                                }
+                            )
+                            log_f.write(f"--- Document ---\n{doc}\n\n")
 
         if not texts_to_embed:
+            statuses[repo_url] = {
+                "status": "done",
+                "commit": commit,
+                "indexed_chunks": 0,
+            }
+            _write_status(status_path, statuses)
             return {"status": "ok", "commit": commit, "indexed_chunks": 0}
 
         print(f"Starting to embed {len(texts_to_embed)} text chunks...")
@@ -270,21 +325,24 @@ def index_repository(
             embeddings=embeddings,
         )
 
+        print(f"Embedding log saved to: {log_file_path}")
+
+        statuses[repo_url] = {
+            "status": "done",
+            "commit": commit,
+            "indexed_chunks": len(ids),
+        }
+        _write_status(status_path, statuses)
+
         return {"status": "ok", "commit": commit, "indexed_chunks": len(ids)}
 
     except Exception as e:
         print(f"An unexpected error occurred during indexing: {e}")
-        # Mark the state as 'failed' so it can be retried without clearing
-        with _index_lock:
-            _indexing_state[repo_url] = "failed"
+        statuses[repo_url] = {"status": "failed", "error": str(e)}
+        _write_status(status_path, statuses)
         return {"status": "error", "message": str(e)}
 
     finally:
-        with _index_lock:
-            # Only mark as 'done' if it hasn't failed
-            if _indexing_state.get(repo_url) == "running":
-                _indexing_state[repo_url] = "done"
-            _indexing_start_times.pop(repo_url, None)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

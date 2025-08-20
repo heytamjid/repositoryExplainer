@@ -285,33 +285,15 @@ def api_ask(request):
         body = json.loads(request.body.decode("utf-8"))
         question = body.get("question", "").strip()
         repo_url = body.get("repo_url", "").strip()
+        action = body.get("action", "ask")  # New: 'ask' or 'start_indexing'
     except json.JSONDecodeError:
         return HttpResponseBadRequest("Invalid JSON")
 
-    if not all([question, repo_url]):
-        return JsonResponse(
-            {"answer": "Both a question and a repository URL are required."}
-        )
+    if not repo_url:
+        return JsonResponse({"answer": "A repository URL is required."})
 
-    if "clear" in question.lower() or "reset" in question.lower():
-        embedder.clear_indexing_state(repo_url)
-        return JsonResponse(
-            {
-                "answer": f"Indexing state cleared for {repo_url}. You can now ask questions again."
-            }
-        )
-
-    repo_status = embedder._indexing_state.get(repo_url)
-
-    if repo_status == "running":
-        return JsonResponse(
-            {
-                "answer": "Repository is currently being indexed. Please try again in a few moments."
-            }
-        )
-
-    if repo_status != "done":
-        print("Repository not indexed. Starting indexing in background...")
+    if action == "start_indexing":
+        print(f"Received request to start indexing for {repo_url}")
 
         def _start_index_task():
             print(f"Starting indexing thread for {repo_url}")
@@ -326,9 +308,35 @@ def api_ask(request):
                 print(f"Indexing thread for {repo_url} failed: {e}")
 
         threading.Thread(target=_start_index_task, daemon=True).start()
+        return JsonResponse({"status": "indexing_started"})
+
+    if not question:
+        return JsonResponse({"answer": "A question is required."})
+
+    if "clear" in question.lower() or "reset" in question.lower():
+        embedder.clear_indexing_state(repo_url, persist_dir=CHROMA_PERSIST_DIR)
         return JsonResponse(
             {
-                "answer": "This repository hasn't been indexed yet. I'm starting the process now. Please ask your question again in a few moments."
+                "answer": f"Indexing state cleared for {repo_url}. You can now ask questions again."
+            }
+        )
+
+    repo_status_data = embedder.get_indexing_status(
+        repo_url, persist_dir=CHROMA_PERSIST_DIR
+    )
+    repo_status = repo_status_data.get("status")
+
+    if repo_status == "running":
+        return JsonResponse(
+            {
+                "answer": "Repository is currently being indexed. Please try again in a few moments."
+            }
+        )
+
+    if repo_status != "done":
+        return JsonResponse(
+            {
+                "answer": "This repository has not been indexed yet. Please click the 'Index Repository' button first."
             }
         )
 
@@ -378,7 +386,7 @@ def api_ask(request):
         chain = prompt_template | llm | StrOutputParser()
         answer = chain.invoke({"question": question, "context": context})
 
-        return JsonResponse({"answer": answer})
+        return JsonResponse({"answer": markdown2.markdown(answer)})
 
     except Exception as e:
         print(f"Error during question answering: {e}")

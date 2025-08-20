@@ -18,15 +18,16 @@
 </head>
 <body>
     <h1>Ask Questions about the Repository</h1>
-    <p>This feature will let you ask natural-language questions about the codebase. Embedding and indexing will run on the server (not enabled yet).</p>
+    <p>First, click the "Index Repository" button to make the codebase searchable. Then, you can ask natural-language questions.</p>
     <div style="margin-bottom:10px;">
         <label for="repoUrl">Repository:</label>
         <input id="repoUrl" type="text" style="width:70%; padding:6px; margin-left:8px;" placeholder="Repository URL will be pre-filled if provided" />
+        <button id="indexRepoBtn" style="margin-left: 8px;">Index Repository</button>
     </div>
 
     <div class="chat-container">
         <div id="messages" class="messages">
-            <div class="message assistant">Hi — ask me where a feature is implemented or to explain a function. (Embedding backend not yet enabled.)</div>
+            <div class="message assistant">Hi! Please index a repository to begin.</div>
         </div>
 
         <div class="input-row">
@@ -34,19 +35,47 @@
             <button id="sendBtn">Send</button>
         </div>
     </div>
-
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script>
         const sendBtn = document.getElementById('sendBtn');
+        const indexRepoBtn = document.getElementById('indexRepoBtn');
         const userInput = document.getElementById('userInput');
         const messages = document.getElementById('messages');
+        const repoUrlField = document.getElementById('repoUrl');
 
-        function appendMessage(text, cls) {
+        function appendMessage(html, cls) {
             const d = document.createElement('div');
             d.className = 'message ' + cls;
-            d.textContent = text;
+            d.innerHTML = html; // Use innerHTML to render markdown
             messages.appendChild(d);
             messages.scrollTop = messages.scrollHeight;
         }
+        
+        indexRepoBtn.addEventListener('click', async () => {
+            const repoVal = repoUrlField.value.trim();
+            if (!repoVal) {
+                appendMessage('Please enter a repository URL first.', 'assistant');
+                return;
+            }
+            appendMessage(`Starting to index ${repoVal}... This may take a few minutes.`, 'assistant');
+            try {
+                const resp = await fetch('/api/ask/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ repo_url: repoVal, action: 'start_indexing' })
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                if (data.status === 'indexing_started') {
+                    appendMessage('Indexing process has begun on the server. You can start asking questions once it is complete.', 'assistant');
+                } else {
+                    appendMessage('Could not start indexing. Please check the server logs.', 'assistant');
+                }
+            } catch (e) {
+                console.error('Error starting indexing:', e);
+                appendMessage('Failed to start indexing: ' + e.message, 'assistant');
+            }
+        });
 
         sendBtn.addEventListener('click', async () => {
             const q = userInput.value.trim();
@@ -54,16 +83,14 @@
             appendMessage(q, 'user');
             userInput.value = '';
 
-            // Call backend API to get an answer
             appendMessage('Thinking...', 'assistant');
             try {
-                const repoField = document.getElementById('repoUrl');
-                const repoVal = repoField ? repoField.value.trim() : '';
+                const repoVal = repoUrlField.value.trim();
                 
                 const resp = await fetch('/api/ask/', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question: q, repo_url: repoVal })
+                    body: JSON.stringify({ question: q, repo_url: repoVal, action: 'ask' })
                 });
                 
                 if (!resp.ok) {
@@ -71,10 +98,9 @@
                 }
                 
                 const data = await resp.json();
-                // remove the temporary 'Thinking...' message
                 const last = messages.querySelectorAll('.message.assistant');
                 if (last.length) last[last.length-1].remove();
-                appendMessage(data.answer || 'No response', 'assistant');
+                appendMessage(marked.parse(data.answer || 'No response'), 'assistant');
             } catch (e) {
                 console.error('Error:', e);
                 const last = messages.querySelectorAll('.message.assistant');
@@ -87,12 +113,10 @@
         (function prefillRepo(){
             const urlParams = new URLSearchParams(window.location.search);
             const q = urlParams.get('repo_url');
-            const repoField = document.getElementById('repoUrl');
-            if (q && repoField) repoField.value = q;
-            // If server passed repo_url in template context, it will be available as a JS global via data attribute
+            if (q) repoUrlField.value = q;
             try{
                 const serverRepo = '{{ repo_url|default:"" }}';
-                if (serverRepo && repoField && !repoField.value) repoField.value = serverRepo;
+                if (serverRepo && !repoUrlField.value) repoUrlField.value = serverRepo;
             }catch(e){ /* template rendering safe fallback */ }
         })();
     </script>
