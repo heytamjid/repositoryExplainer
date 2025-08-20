@@ -11,12 +11,14 @@ import time
 
 import pathspec
 import chromadb
+import ast
 
 # --- Configuration ---
-EMBEDDING_MODEL = "models/text-embedding-004"
+# ## MODIFIED ##: Corrected the model name to the official one.
+EMBEDDING_MODEL = "models/embedding-001"
 EMBEDDING_TASK_TYPE = Literal["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"]
-EMBEDDING_BATCH_SIZE = 100  # Google's API limit per request
-EMBEDDING_DIMENSIONS = 768  # text-embedding-004 produces 768-dim vectors
+EMBEDDING_BATCH_SIZE = 100
+EMBEDDING_DIMENSIONS = 768
 
 # --- Module-level State Management ---
 _indexing_state: Dict[str, str] = {}
@@ -79,11 +81,10 @@ def _extract_python_units(path: Path) -> List[Dict]:
         return []
 
     units = []
-    # Using ast.walk is simpler than a custom NodeVisitor for this task
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             start = node.lineno
-            end = getattr(node, "end_lineno", start)  # end_lineno may not be present
+            end = getattr(node, "end_lineno", start)
             code = "\n".join(src.splitlines()[start - 1 : end])
             units.append(
                 {
@@ -126,13 +127,11 @@ def _chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> List[st
     return chunks
 
 
-## --- REFACTORED: Unified and Batched Embedding Function ---
 def get_embeddings(
     texts: List[str], task_type: EMBEDDING_TASK_TYPE
 ) -> List[List[float]]:
     """
     Gets embeddings for a list of texts using the Google Generative AI API.
-    This function now handles batching correctly.
     """
     import requests
 
@@ -142,7 +141,6 @@ def get_embeddings(
 
     all_embeddings = []
 
-    # Process texts in batches to respect the API's limit
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
         batch_texts = texts[i : i + EMBEDDING_BATCH_SIZE]
 
@@ -150,7 +148,6 @@ def get_embeddings(
             f"Processing embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
         )
 
-        # Prepare the request payload with multiple documents
         requests_payload = [
             {
                 "model": EMBEDDING_MODEL,
@@ -172,15 +169,17 @@ def get_embeddings(
             batch_embeddings = [item["values"] for item in result["embeddings"]]
             all_embeddings.extend(batch_embeddings)
 
-            # Small delay to avoid hitting rate limits too hard
-            time.sleep(0.1)
+            # ## MODIFIED ##: Increased sleep time to avoid hitting API rate limits.
+            # A 4-second delay respects a 15 requests-per-minute limit.
+            print("Waiting for 4 seconds to respect API rate limits...")
+            time.sleep(4)
 
         except Exception as e:
-            print(
-                f"Error embedding batch: {e}. Using zero vectors as fallback for this batch."
-            )
-            # Add fallback zero vectors for each item in the failed batch
-            all_embeddings.extend([[0.0] * EMBEDDING_DIMENSIONS] * len(batch_texts))
+            # ## MODIFIED ##: Removed zero-vector fallback.
+            # Now, if an error occurs, we print it and re-raise the exception
+            # to stop the indexing process immediately.
+            print(f"Fatal error embedding batch: {e}. Stopping indexing.")
+            raise e
 
     return all_embeddings
 
@@ -194,7 +193,7 @@ def index_repository(
     with _index_lock:
         if _indexing_state.get(repo_url) == "running":
             start_time = _indexing_start_times.get(repo_url)
-            if start_time and time.time() - start_time > 600:  # 10-minute timeout
+            if start_time and time.time() - start_time > 600:
                 print(f"Indexing for {repo_url} timed out, resetting state")
                 _indexing_state.pop(repo_url, None)
                 _indexing_start_times.pop(repo_url, None)
@@ -275,11 +274,16 @@ def index_repository(
 
     except Exception as e:
         print(f"An unexpected error occurred during indexing: {e}")
+        # Mark the state as 'failed' so it can be retried without clearing
+        with _index_lock:
+            _indexing_state[repo_url] = "failed"
         return {"status": "error", "message": str(e)}
 
     finally:
         with _index_lock:
-            _indexing_state[repo_url] = "done"
+            # Only mark as 'done' if it hasn't failed
+            if _indexing_state.get(repo_url) == "running":
+                _indexing_state[repo_url] = "done"
             _indexing_start_times.pop(repo_url, None)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -300,7 +304,6 @@ def query_repository(
         return []
 
     try:
-        # Use the same refactored embedding function for the query
         query_embedding = get_embeddings([question], "RETRIEVAL_QUERY")[0]
     except Exception as e:
         print(f"Failed to embed query: {e}")

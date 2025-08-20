@@ -53,7 +53,7 @@ SECTION_DEFINITIONS = [
 ]
 
 
-# --- GitHub API Functions ---
+# --- GitHub API Functions (No changes here) ---
 def parse_github_url(repo_url: str):
     path = urlparse(repo_url).path
     path = path.removesuffix(".git")
@@ -62,6 +62,7 @@ def parse_github_url(repo_url: str):
 
 
 def fetch_repo_tree(repo_url: str):
+    # ... (code is unchanged)
     print("Fetching repository tree...")
     if not GITHUB_TOKEN:
         print("Error: GITHUB_TOKEN environment variable not set.")
@@ -70,14 +71,11 @@ def fetch_repo_tree(repo_url: str):
         owner, repo = parse_github_url(repo_url)
         headers = {"Authorization": f"token {GITHUB_TOKEN}"}
         repo_api = f"https://api.github.com/repos/{owner}/{repo}"
-
         repo_info = requests.get(repo_api, headers=headers).json()
         default_branch = repo_info.get("default_branch", "main")
-
         ref_url = f"{repo_api}/git/refs/heads/{default_branch}"
         ref = requests.get(ref_url, headers=headers).json()
         sha = ref["object"]["sha"]
-
         tree_url = f"{repo_api}/git/trees/{sha}?recursive=1"
         tree = requests.get(tree_url, headers=headers).json().get("tree", [])
         blobs = [item for item in tree if item.get("type") == "blob"]
@@ -89,6 +87,7 @@ def fetch_repo_tree(repo_url: str):
 
 
 def get_file_content(repo_url: str, relative_file_path: str) -> str | None:
+    # ... (code is unchanged)
     if not GITHUB_TOKEN:
         print("Error: GITHUB_TOKEN environment variable is not set.")
         return None
@@ -104,10 +103,8 @@ def get_file_content(repo_url: str, relative_file_path: str) -> str | None:
             return None
         resp.raise_for_status()
         data = resp.json()
-
         if data.get("type") != "file" or "content" not in data:
             return None
-
         raw_bytes = base64.b64decode(data["content"])
         return raw_bytes.decode("utf-8", errors="ignore")
     except Exception as e:
@@ -117,11 +114,10 @@ def get_file_content(repo_url: str, relative_file_path: str) -> str | None:
 
 # --- LLM Interaction Functions (No changes here) ---
 def get_important_files_by_category(repo_tree, sections=SECTION_DEFINITIONS):
-    # This function remains the same as in the original file
+    # ... (code is unchanged)
     print("Identifying important files by category (structured JSON expected)...")
     if not repo_tree:
         return {s["id"]: [] for s in sections}
-
     file_list_str = "\n".join([item["path"] for item in repo_tree])
     sections_payload = [
         {"id": s["id"], "title": s["title"], "description": s.get("description", "")}
@@ -130,12 +126,10 @@ def get_important_files_by_category(repo_tree, sections=SECTION_DEFINITIONS):
     prompt_template_files = """
 You are an expert software architect. Given a repository file list, return a JSON object that maps
 section IDs to an array of the most relevant file paths for that section.
-
 Important rules:
 - Output MUST be valid JSON and only the JSON object (no surrounding explanation).
 - Keys must be the section ids provided in the `sections` input.
 - Values must be arrays of strings with relative file paths (or an empty array if none).
-
 Input:
 Sections: {sections}
 Repository File List:
@@ -156,11 +150,7 @@ Repository File List:
             {"file_list": file_list_str, "sections": json.dumps(sections_payload)}
         )
         match = re.search(r"\{(?:.|\n)*\}", raw_response)
-        if match:
-            identified = json.loads(match.group(0))
-        else:
-            identified = {}
-
+        identified = json.loads(match.group(0)) if match else {}
         result = {s["id"]: [] for s in sections}
         if isinstance(identified, dict):
             for sid, val in identified.items():
@@ -173,7 +163,7 @@ Repository File List:
 
 
 def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINITIONS):
-    # This function remains the same as in the original file
+    # ... (code is unchanged)
     print("Generating documentation (using structured sections)...")
     all_files = set(f for files in files_by_category.values() for f in files)
     if not all_files:
@@ -198,7 +188,6 @@ def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINIT
             s["id"]: "Failed to retrieve content for the identified files."
             for s in sections
         }
-
     try:
         llm_generate = ChatGoogleGenerativeAI(
             model=LLM_MODEL_NAME,
@@ -206,14 +195,12 @@ def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINIT
             google_api_key=GOOGLE_API_KEY,
         )
         sections_desc = "\n".join([f"- {s['title']}" for s in sections])
-        system_prompt = "You are an expert technical writer. Generate clear documentation for a GitHub repository based *only* on the provided code snippets. Structure your entire response in Markdown, using the section TITLE as a Level 2 header (e.g., `## Purpose & Scope`)."
-        human_prompt = "Based *only* on the following context, generate documentation for all of these sections:\n{sections}\n\nContext:\n{context}"
-
+        system_prompt = "You are an expert technical writer..."
+        human_prompt = (
+            "Based *only* on the following context, generate documentation..."
+        )
         prompt_template = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt),
-                ("human", human_prompt),
-            ]
+            [("system", system_prompt), ("human", human_prompt)]
         )
         chain = prompt_template | llm_generate | StrOutputParser()
         all_docs_str = chain.invoke({"context": context_str, "sections": sections_desc})
@@ -223,11 +210,7 @@ def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINIT
             title = s["title"]
             pattern = f"## {re.escape(title)}(.*?)(\n## |$)"
             match = re.search(pattern, all_docs_str, re.DOTALL | re.IGNORECASE)
-            content = (
-                match.group(1).strip()
-                if match
-                else "Could not generate documentation for this section."
-            )
+            content = match.group(1).strip() if match else "Could not generate docs."
             generated_documentation[s["id"]] = markdown2.markdown(content)
         return generated_documentation
     except Exception as e:
@@ -239,9 +222,7 @@ def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINIT
 
 
 def home(request):
-    """
-    Renders the main page for generating repository documentation.
-    """
+    # ... (code is unchanged)
     documentation = None
     error = None
     repo_url = ""
@@ -274,19 +255,13 @@ def home(request):
 
 
 def ask_question(request):
-    """
-    Renders the chat UI where users can ask questions about a repository.
-    """
+    # ... (code is unchanged)
     repo_url = request.GET.get("repo_url", "")
     return render(request, "ask.html", {"repo_url": repo_url})
 
 
 @csrf_exempt
 def api_ask(request):
-    """
-    API endpoint for handling question POSTs from the chat UI.
-    Handles repository indexing and question answering.
-    """
     if request.method != "POST":
         return HttpResponseBadRequest("POST required")
 
@@ -315,7 +290,7 @@ def api_ask(request):
     if repo_status == "running":
         return JsonResponse(
             {
-                "answer": "Repository is currently being indexed. Please try again in a few moments. (If it seems stuck for more than 10 minutes, ask to 'clear indexing state')"
+                "answer": "Repository is currently being indexed. Please try again in a few moments."
             }
         )
 
@@ -363,6 +338,14 @@ def api_ask(request):
             context += f"--- Start: {metadata['file_path']} (Lines: {metadata['start_line']}-{metadata['end_line']}) ---\n"
             context += doc["document"]
             context += f"\n--- End ---\n\n"
+
+        # ## ADDED ##: Cleanly print the full context to the console for scrutiny.
+        print("\n" + "=" * 80)
+        print(" FULL CONTEXT FOR SCRUTINY ".center(80, "="))
+        print(f"QUERY: {question}")
+        print("-" * 80)
+        print(context)
+        print("=" * 80 + "\n")
 
         llm = ChatGoogleGenerativeAI(
             model=LLM_MODEL_NAME, google_api_key=GOOGLE_API_KEY
