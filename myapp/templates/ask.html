@@ -54,25 +54,32 @@
             appendMessage(q, 'user');
             userInput.value = '';
 
-            // Call backend API (placeholder) to get an answer
+            // Call backend API to get an answer
             appendMessage('Thinking...', 'assistant');
             try {
                 const repoField = document.getElementById('repoUrl');
                 const repoVal = repoField ? repoField.value.trim() : '';
+                
                 const resp = await fetch('/api/ask/', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ question: q, repo_url: repoVal })
                 });
+                
+                if (!resp.ok) {
+                    throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+                }
+                
                 const data = await resp.json();
                 // remove the temporary 'Thinking...' message
                 const last = messages.querySelectorAll('.message.assistant');
                 if (last.length) last[last.length-1].remove();
                 appendMessage(data.answer || 'No response', 'assistant');
             } catch (e) {
+                console.error('Error:', e);
                 const last = messages.querySelectorAll('.message.assistant');
                 if (last.length) last[last.length-1].remove();
-                appendMessage('Failed to contact server.', 'assistant');
+                appendMessage('Failed to contact server: ' + e.message, 'assistant');
             }
         });
 
