@@ -8,6 +8,7 @@ from collections import defaultdict
 import time
 
 from django.shortcuts import render
+from django.http import JsonResponse, HttpResponseBadRequest
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -362,3 +363,39 @@ def home(request):
             "sections": SECTION_DEFINITIONS,
         },
     )
+
+
+def ask_question(request):
+    """Render the chat UI where users can ask questions about the repository.
+    Embedding/indexing will be implemented later; this view only renders the page.
+    """
+    # Allow pre-filling the repo URL via query parameter (from home page)
+    repo_url = request.GET.get("repo_url", "")
+    return render(request, "ask.html", {"repo_url": repo_url})
+
+
+def api_ask(request):
+    """Placeholder API endpoint for handling question POSTs from the chat UI.
+    Currently returns a static message; embedding/indexing logic will be added later.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest("POST required")
+    try:
+        body = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON")
+    question = body.get("question", "").strip()
+    repo_url = body.get("repo_url", "").strip()
+    if not question:
+        return JsonResponse({"answer": "Please provide a question."})
+
+    # Placeholder answer. Actual retrieval + LLM answer generation will be implemented later.
+    placeholder = (
+        "Embedding backend not yet enabled. When enabled, the server will index the repository and "
+        "return grounded answers with provenance (file path + lines)."
+    )
+    # Include repo_url in placeholder response for client-side verification
+    resp = {"answer": placeholder}
+    if repo_url:
+        resp["repo_url"] = repo_url
+    return JsonResponse(resp)

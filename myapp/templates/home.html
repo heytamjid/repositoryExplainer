@@ -80,10 +80,12 @@
 </head>
 <body>
     <h1>Repository Explainer</h1>
-    <form method="post">
+    <form method="post" style="display:flex; gap:10px; align-items:center;">
         {% csrf_token %}
-        <input type="text" name="repo_url" placeholder="Enter GitHub Repository URL" value="{{ repo_url|default:'' }}" required>
+        <input id="repo_url_input" type="text" name="repo_url" placeholder="Enter GitHub Repository URL" value="{{ repo_url|default:'' }}" required>
         <button type="submit">Explain Repository</button>
+        <!-- Allow user to go directly to the Q&A chat without generating a summary -->
+        <button type="button" onclick="(function(){const v=document.getElementById('repo_url_input').value||''; window.location.href='{% url 'ask_question' %}?repo_url='+encodeURIComponent(v);})()" style="background-color:#28a745;">ASK QUESTION</button>
     </form>
 
     {% if error %}
