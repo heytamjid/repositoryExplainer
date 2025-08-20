@@ -195,10 +195,17 @@ def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINIT
             google_api_key=GOOGLE_API_KEY,
         )
         sections_desc = "\n".join([f"- {s['title']}" for s in sections])
-        system_prompt = "You are an expert technical writer..."
-        human_prompt = (
-            "Based *only* on the following context, generate documentation..."
-        )
+        system_prompt = """You are an expert technical writer. Your task is to create a high-level, structured, and clear documentation for a software repository based on the provided file contents.
+
+Follow these rules strictly:
+1.  **Generate documentation for ALL sections listed below.**
+2.  **Use the exact section titles provided, formatted as Markdown H2 headings (e.g., `## Purpose & Scope`).**
+3.  **Base your analysis *only* on the provided file content.** Do not invent or assume features.
+4.  If the provided context is insufficient for a section, write "Insufficient information to generate this section."
+
+**Sections to generate:**
+{sections}"""
+        human_prompt = "Here is the repository context:\n\n{context}"
         prompt_template = ChatPromptTemplate.from_messages(
             [("system", system_prompt), ("human", human_prompt)]
         )
@@ -206,11 +213,20 @@ def generate_documentation(repo_url, files_by_category, sections=SECTION_DEFINIT
         all_docs_str = chain.invoke({"context": context_str, "sections": sections_desc})
 
         generated_documentation = {}
+        # Fallback for when the LLM doesn't follow instructions perfectly
+        if "##" not in all_docs_str:
+            return {s["id"]: markdown2.markdown(all_docs_str) for s in sections}
+
         for s in sections:
             title = s["title"]
+            # Regex to find the content under a specific H2 heading until the next H2 or end of string
             pattern = f"## {re.escape(title)}(.*?)(\n## |$)"
             match = re.search(pattern, all_docs_str, re.DOTALL | re.IGNORECASE)
-            content = match.group(1).strip() if match else "Could not generate docs."
+            content = (
+                match.group(1).strip()
+                if match
+                else "Could not generate docs for this section."
+            )
             generated_documentation[s["id"]] = markdown2.markdown(content)
         return generated_documentation
     except Exception as e:
