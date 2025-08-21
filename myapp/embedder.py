@@ -955,6 +955,9 @@ def classify_question(question: str) -> str:
                 for k in ["architecture", "overview", "data flow", "flow", "design"]
             ):
                 winner = HIGH_LEVEL_LABEL
+            print(
+                f"[PIPELINE] Classification: '{question}' -> {winner} (scores: low={scores.get(LOW_LEVEL_LABEL):.4f}, high={scores.get(HIGH_LEVEL_LABEL):.4f})"
+            )
             return winner
     except Exception as e:
         print(f"Classifier fallback due to error: {e}")
@@ -994,12 +997,14 @@ def _query_chroma_raw(
 
     where_clause = _normalize_where(where)
     try:
+        print(f"[PIPELINE] Querying Chroma where={where_clause} top_k={top_k}")
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
             where=where_clause,
         )
         if not results or not results.get("documents"):
+            print("[PIPELINE] Query returned 0 documents")
             return []
         docs = results["documents"][0]
         metas = results["metadatas"][0]
@@ -1025,6 +1030,7 @@ def query_repository_advanced(
 
     Returns dict with keys: classification, documents (list like query_repository), debug(optional)
     """
+    print("[PIPELINE] Starting advanced retrieval pipeline")
     classification = classify_question(question)
     mode = embedding_mode or EMBEDDING_MODE
     try:
@@ -1046,17 +1052,20 @@ def query_repository_advanced(
     debug = {"classification": classification}
 
     if classification == LOW_LEVEL_LABEL:
-        # Direct unit-level retrieval
+        print("[PIPELINE] Path: LOW_LEVEL -> single-stage unit retrieval")
         unit_docs = _query_chroma_raw(
             collection,
             query_embedding,
             {"repo_url": repo_url, "granularity": "unit"},
             top_k_units,
         )
+        print(f"[PIPELINE] Retrieved {len(unit_docs)} unit docs")
         grouped = _group_unit_docs(unit_docs)
+        print(f"[PIPELINE] Grouped into {len(grouped)} grouped docs (low-level)")
         return {"classification": classification, "documents": grouped, "debug": debug}
 
     # High-level: 2 stage
+    print("[PIPELINE] Path: HIGH_LEVEL -> stage1 file-level retrieval")
     file_docs = _query_chroma_raw(
         collection,
         query_embedding,
@@ -1064,18 +1073,23 @@ def query_repository_advanced(
         HIGH_LEVEL_TOP_K_FILES,
     )
     if not file_docs:
-        # fallback to low-level
+        print(
+            "[PIPELINE] Stage1 returned 0 file docs; falling back to LOW_LEVEL strategy"
+        )
         unit_docs = _query_chroma_raw(
             collection,
             query_embedding,
             {"repo_url": repo_url, "granularity": "unit"},
             top_k_units,
         )
+        print(f"[PIPELINE] Fallback retrieved {len(unit_docs)} unit docs")
         grouped = _group_unit_docs(unit_docs)
+        print(f"[PIPELINE] Grouped into {len(grouped)} fallback grouped docs")
         return {"classification": classification, "documents": grouped, "debug": debug}
 
     selected_files = [d["metadata"]["file_path"] for d in file_docs]
     debug["selected_files"] = selected_files
+    print(f"[PIPELINE] Stage1 selected {len(selected_files)} files: {selected_files}")
 
     # Retrieve unit-level inside each selected file
     per_file_units: List[Dict] = []
@@ -1088,8 +1102,14 @@ def query_repository_advanced(
             HIGH_LEVEL_UNIT_PER_FILE,
         )
         per_file_units.extend(units_for_file)
+        print(
+            f"[PIPELINE] Retrieved {len(units_for_file)} unit docs for file {fp} (cumulative {len(per_file_units)})"
+        )
 
     grouped = _group_unit_docs(per_file_units, file_docs)
+    print(
+        f"[PIPELINE] Grouped high-level results into {len(grouped)} grouped docs (total unit docs considered {len(per_file_units)})"
+    )
     return {"classification": classification, "documents": grouped, "debug": debug}
 
 
@@ -1162,6 +1182,9 @@ def _group_unit_docs(
                 },
             }
         )
+    print(
+        f"[PIPELINE] Grouping complete: {len(merged_docs)} grouped docs; truncated due to size limit? {'YES' if len(merged_docs) < len(files) else 'NO'}"
+    )
     # Fallback: if grouping produced nothing due to size limit, return raw units
     if not merged_docs:
         return unit_docs

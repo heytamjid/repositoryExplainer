@@ -451,21 +451,50 @@ def api_ask(request):
                 }
             )
 
+        # Build context using grouped docs; we'll append summary if available
         context = f"Query classification: {classification}\n\nContext from repository grouped by file:\n"
         for doc in retrieved_docs:
             metadata = doc["metadata"]
             context += f"=== FILE: {metadata['file_path']} (Lines: {metadata['start_line']}-{metadata['end_line']}) ===\n"
-            context += doc["document"]
-            context += f"\n\n"
+            context += doc["document"] + "\n\n"
 
-        # Cleanly print the full context to the console for scrutiny.
+        # Attempt to include cached summary (if exists) to enrich high-level answers
+        cached_summary = get_summary(repo_url)
+        summary_text = None
+        if cached_summary and isinstance(cached_summary.get("summary"), dict):
+            # Concatenate all section contents (already markdown) with headings
+            sections_summary_parts = []
+            for sid, content in cached_summary["summary"].items():
+                # sid -> find matching title
+                title = next(
+                    (s["title"] for s in SECTION_DEFINITIONS if s["id"] == sid),
+                    sid,
+                )
+                sections_summary_parts.append(f"## {title}\n{content}\n")
+            summary_text = "\n".join(sections_summary_parts)
+            context += "\n\n=== REPOSITORY SUMMARY (Precomputed) ===\n" + summary_text
+
+        # Metadata-only console logging
         print("\n" + "=" * 80)
-        print(" FULL CONTEXT FOR SCRUTINY ".center(80, "="))
+        print(" PIPELINE METADATA SUMMARY ".center(80, "="))
         print(f"QUERY: {question}")
         print(f"EMBEDDING MODE: {embedding_mode or embedder.EMBEDDING_MODE}")
         print(f"CLASSIFICATION: {classification}")
+        print(f"GROUPED DOC COUNT: {len(retrieved_docs)}")
+        total_chars = sum(len(d["document"]) for d in retrieved_docs)
+        print(f"TOTAL GROUPED CHARS: {total_chars}")
+        if summary_text:
+            print(
+                f"SUMMARY INCLUDED: YES (chars={len(summary_text)}) - sections={len(cached_summary['summary'])}"
+            )
+        else:
+            print("SUMMARY INCLUDED: NO")
         print("-" * 80)
-        print(context)
+        for idx, doc in enumerate(retrieved_docs, 1):
+            m = doc["metadata"]
+            print(
+                f"[{idx}] file={m.get('file_path')} lines={m.get('start_line')}-{m.get('end_line')} gran={m.get('granularity')} size={len(doc['document'])}"
+            )
         print("=" * 80 + "\n")
 
         llm = ChatGoogleGenerativeAI(
