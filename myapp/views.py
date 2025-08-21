@@ -504,7 +504,19 @@ def api_ask(request):
             [
                 (
                     "system",
-                    "You are a helpful assistant that answers questions about a code repository based *only* on the provided context. Be concise and clear. If the context doesn't contain the answer, say so.",
+                    (
+                        "You are a helpful assistant that answers questions about a code repository based *only* on the provided context. \n"
+                        "Explain elaborately and precisely. If the context does not contain the answer, explicitly say so.\n\n"
+                        "When you reference implementation details, ALWAYS include the minimal, relevant code snippet(s) taken verbatim from the provided context inside fenced code blocks.\n"
+                        "Guidelines for code snippets:\n"
+                        "- Use fenced code blocks with an appropriate language tag (e.g. ```python).\n"
+                        "- Trim to only the lines needed to answer. Avoid large unneeded dumps.\n"
+                        "- If multiple locations are relevant, show each in its own block prefixed by the file path (and line span if present in the context header).\n"
+                        "- Do NOT invent or modify code that is not in the context. If something is implied but not shown, state the limitation.\n"
+                        "- If the answer is conceptual (architecture / design) but specific functions are mentioned in context, still show a concise supporting snippet.\n"
+                        "- If no code is relevant, just state the answer without forcing a code block.\n"
+                        "Keep explanations concise after each snippet (1–3 sentences)."
+                    ),
                 ),
                 ("human", "Question: {question}\n\nContext:\n{context}"),
             ]
