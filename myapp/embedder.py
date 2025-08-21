@@ -15,6 +15,13 @@ import pathspec
 import chromadb
 import ast
 
+# New import for language-aware splitting
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
+except Exception:  # pragma: no cover - optional dependency errors handled later
+    RecursiveCharacterTextSplitter = None  # type: ignore
+    Language = None  # type: ignore
+
 # --- Configuration ---
 # Embedding Configuration (unit-level and file-level)
 EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "local")  # "local" or "remote"
@@ -114,6 +121,48 @@ DENY_DIR_NAMES = {
 
 # Max file size (bytes) to consider for indexing (default 200 KB)
 MAX_FILE_SIZE_BYTES = int(os.environ.get("REPO_EXPLAINER_MAX_FILE_SIZE", 200 * 1024))
+
+# Generic (non-Python) code splitting configuration
+CODE_SPLIT_CHUNK_SIZE = int(
+    os.environ.get("REPO_EXPLAINER_CODE_CHUNK_SIZE", 1800)
+)  # Target characters per chunk
+CODE_SPLIT_CHUNK_OVERLAP = int(
+    os.environ.get("REPO_EXPLAINER_CODE_CHUNK_OVERLAP", 200)
+)  # Character overlap for continuity
+MAX_UNIT_CHARS = int(
+    os.environ.get("REPO_EXPLAINER_MAX_UNIT_CHARS", 6000)
+)  # Hard ceiling safeguard for any single unit (trim/split if exceeded)
+
+# Map file extensions to LangChain Language enum (best-effort; missing entries fallback to custom separators)
+LANG_EXT_MAP = {
+    ".js": "JS",
+    ".ts": "TS",
+    ".jsx": "JS",
+    ".tsx": "TS",
+    ".java": "JAVA",
+    ".go": "GO",
+    ".rs": "RUST",
+    ".php": "PHP",
+    ".rb": "RUBY",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "CPP",
+    ".cc": "CPP",
+    ".hpp": "CPP",
+    ".cs": "CSHARP",
+    ".swift": "SWIFT",
+    ".scala": "SCALA",
+    ".kt": "KOTLIN",
+    ".kts": "KOTLIN",
+    ".html": "HTML",
+    ".htm": "HTML",
+    ".css": "CSS",
+    ".md": "MARKDOWN",
+    ".json": "JSON",
+    ".xml": "XML",
+    ".yml": "YAML",
+    ".yaml": "YAML",
+}
 
 
 # Small helper to heuristically detect binary files by sampling the beginning bytes
@@ -474,6 +523,192 @@ def _fallback_file_unit(path: Path) -> Dict:
     }
 
 
+def _detect_language(path: Path) -> Optional[str]:
+    """Return a LangChain Language enum name (string) for a file path or None.
+
+    We store enum name as string to avoid hard dependency if LangChain not present.
+    """
+    return LANG_EXT_MAP.get(path.suffix.lower())
+
+
+def _derive_block_name(block: str, language_hint: Optional[str], index: int) -> str:
+    """Heuristic name derivation for a code block (non-Python)."""
+    first_line = next((l.strip() for l in block.splitlines() if l.strip()), "")
+    if not first_line:
+        return f"block_{index}" if language_hint else f"chunk_{index}"
+    import re
+
+    patterns = []
+    if language_hint in {"JS", "TS"}:
+        patterns = [
+            r"(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)",
+            r"class\s+([A-Za-z0-9_]+)",
+            r"const\s+([A-Za-z0-9_]+)\s*=\s*\(.*?=>",
+        ]
+    elif language_hint == "JAVA":
+        patterns = [
+            r"(class|interface|enum)\s+([A-Z][A-Za-z0-9_]*)",
+            r"(?:public|protected|private)?\s+(?:static\s+)?[A-Za-z0-9_<>,\[\]]+\s+([a-zA-Z_][A-Za-z0-9_]*)\s*\(",
+        ]
+    elif language_hint == "GO":
+        patterns = [
+            r"func\s+\([^)]+\)\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"func\s+([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+    elif language_hint == "RUST":
+        patterns = [r"fn\s+([a-zA-Z_][A-Za-z0-9_]*)", r"struct\s+([A-Z][A-Za-z0-9_]*)"]
+    elif language_hint == "PHP":
+        patterns = [
+            r"function\s+([A-Za-z_][A-Za-z0-9_]*)",
+            r"class\s+([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+    elif language_hint == "CSHARP":
+        patterns = [
+            r"class\s+([A-Z][A-Za-z0-9_]*)",
+            r"(public|private|internal|protected)\s+.*?\s([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        ]
+    elif language_hint == "HTML":
+        patterns = [r"<([A-Za-z0-9]+)(?:\s|>)", r"<div[^>]*class=\"([^\"]+)\""]
+    # Generic fallback patterns
+    if not patterns:
+        patterns = [
+            r"([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+    for pat in patterns:
+        try:
+            m = re.search(pat, first_line)
+            if m:
+                # Prefer last capturing group with name-like content
+                groups = [g for g in m.groups() if g and g.isidentifier()]
+                if groups:
+                    return groups[-1][:80]
+        except re.error:
+            continue
+    # Fallback to truncated first line
+    return first_line[:60].replace(" `", "").replace("\t", " ") or f"block_{index}"
+
+
+def _extract_generic_code_units(path: Path) -> List[Dict]:
+    """Extract logical code units for non-Python languages using RecursiveCharacterTextSplitter.
+
+    Each returned unit is already a final chunk (we set already_chunked=True) so the indexing pipeline
+    will not further subdivide it unless it still violates MAX_UNIT_CHARS (defensive trimming applied).
+    """
+    try:
+        src = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    if not src.strip():
+        return []
+    if RecursiveCharacterTextSplitter is None:
+        # Fallback minimal splitting if dependency unavailable
+        return [
+            {
+                "name": path.name,
+                "type": "file",
+                "start_line": 1,
+                "end_line": src.count("\n") + 1,
+                "code": src[:MAX_UNIT_CHARS],
+                "already_chunked": True,
+            }
+        ]
+
+    language_name = _detect_language(path)
+    splitter_kwargs = {
+        "chunk_size": CODE_SPLIT_CHUNK_SIZE,
+        "chunk_overlap": CODE_SPLIT_CHUNK_OVERLAP,
+    }
+    splitter = None
+    if language_name and Language is not None:
+        # Attempt to resolve dynamically; if attribute missing fall back to generic
+        lang_enum = getattr(Language, language_name, None)
+        if lang_enum is not None:
+            try:
+                splitter = RecursiveCharacterTextSplitter.from_language(
+                    language=lang_enum, **splitter_kwargs
+                )
+            except Exception:
+                splitter = None
+    if splitter is None:
+        # Generic recursive splitter with common code separators
+        generic_separators = [
+            "\nclass ",
+            "\ninterface ",
+            "\nstruct ",
+            "\nfunc ",
+            "\nfunction ",
+            "\nexport function ",
+            "\nexport const ",
+            "\nconst ",
+            "\npublic ",
+            "\nprivate ",
+            "\nprotected ",
+            "\n#[",
+            "\n<template",
+            "\n<script",
+            "\n<style",
+            "\n<section",
+            "\n<div",
+            "\n",
+            " ",
+            "",
+        ]
+        splitter = RecursiveCharacterTextSplitter(
+            separators=generic_separators, **splitter_kwargs
+        )
+
+    # Perform split
+    try:
+        docs = splitter.create_documents([src])
+    except Exception:
+        return []
+
+    # Precompute line breaks for line number mapping
+    line_starts = [0]
+    for idx, ch in enumerate(src):
+        if ch == "\n":
+            line_starts.append(idx + 1)
+
+    def char_index_to_line(ci: int) -> int:
+        # Binary search (simple linear since number of lines is manageable)
+        import bisect
+
+        return bisect.bisect_right(line_starts, ci)
+
+    units: List[Dict] = []
+    cursor = 0
+    for i, d in enumerate(docs):
+        text = d.page_content
+        if not text.strip():
+            continue
+        # Locate block in original source starting at/after cursor for robustness
+        pos = src.find(text, cursor)
+        if pos == -1:
+            # Fallback: global search
+            pos = src.find(text)
+        if pos == -1:
+            pos = cursor  # give up; approximate
+        start_char = pos
+        end_char = pos + len(text)
+        cursor = end_char  # move forward
+        start_line = char_index_to_line(start_char)
+        end_line = char_index_to_line(max(0, end_char - 1))
+        name = _derive_block_name(text, language_name, i)
+        # Enforce max unit size safeguard
+        trimmed_text = text[:MAX_UNIT_CHARS]
+        units.append(
+            {
+                "name": name,
+                "type": "code_block",
+                "start_line": start_line,
+                "end_line": end_line,
+                "code": trimmed_text,
+                "already_chunked": True,
+            }
+        )
+    return units
+
+
 def _group_units_into_file_chunks(
     path: Path, units: List[Dict]
 ) -> List[Tuple[str, int, int, int]]:
@@ -698,11 +933,16 @@ def index_repository(
                         continue
 
                     is_python = fp.suffix == ".py"
-                    units = _extract_python_units(fp) if is_python else []
-                    if not units:
-                        # Non-Python or no units, treat whole file as single unit for unit-level fallback
-                        fu = _fallback_file_unit(fp)
-                        units = [fu]
+                    if is_python:
+                        units = _extract_python_units(fp)
+                        if not units:
+                            # Python file but no detected units; fall back to whole file
+                            units = [_fallback_file_unit(fp)]
+                    else:
+                        # Language-aware generic extraction
+                        units = _extract_generic_code_units(fp)
+                        if not units:
+                            units = [_fallback_file_unit(fp)]  # final fallback
                     rel_path_str = str(fp.relative_to(tmpdir)).replace("\\", "/")
                     # Add to repo map
                     try:
@@ -713,7 +953,8 @@ def index_repository(
                         {
                             "path": rel_path_str,
                             "size": size_bytes,
-                            "is_python": is_python,
+                            "language": "python" if is_python else _detect_language(fp),
+                            # Include units for all languages now
                             "units": [
                                 {
                                     "name": u["name"],
@@ -722,12 +963,15 @@ def index_repository(
                                     "end_line": u["end_line"],
                                 }
                                 for u in units
-                                if is_python
+                                if u.get("type")
+                                != "file"  # skip whole-file fallback entries
                             ],
                         }
                     )
 
                     # --- File-level chunks (granularity=file) ---
+                    # File-level chunks: only use unit boundaries for Python (precise) – for others we still
+                    # window the full file unless it is small. We can later enhance to use generic units too.
                     file_chunks = _group_units_into_file_chunks(
                         fp, units if is_python else []
                     )
@@ -755,7 +999,30 @@ def index_repository(
 
                     # --- Unit-level chunks (granularity=unit) ---
                     for u in units:
-                        unit_chunks = _chunk_text(u["code"])
+                        if u.get("already_chunked"):
+                            # Already a final logical chunk
+                            doc = (
+                                f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"  # header
+                                f"```\n{u['code']}\n```"
+                            )
+                            texts_to_embed.append(doc)
+                            metadata_for_text.append(
+                                {
+                                    "repo_url": repo_url,
+                                    "commit": commit,
+                                    "file_path": rel_path_str,
+                                    "unit_name": u["name"],
+                                    "unit_type": u["type"],
+                                    "granularity": "unit",
+                                    "start_line": u["start_line"],
+                                    "end_line": u["end_line"],
+                                    "chunk_index": 0,
+                                    "embedding_mode": mode,
+                                }
+                            )
+                            log_f.write(f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
+                            continue
+                        unit_chunks = _chunk_text(u["code"])  # Python or large fallback
                         for idx, ch in enumerate(unit_chunks):
                             doc = (
                                 f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"  # header
@@ -1336,11 +1603,14 @@ def build_repo_map(
                 if _should_skip_file(fp, tmpdir, spec):
                     continue
                 is_python = fp.suffix == ".py"
-                units = _extract_python_units(fp) if is_python else []
-                if not units:
-                    # For non-Python or empty, add a fallback whole-file unit (for potential function-level reasoning fallback)
-                    fu = _fallback_file_unit(fp)
-                    units = [fu]
+                if is_python:
+                    units = _extract_python_units(fp)
+                    if not units:
+                        units = [_fallback_file_unit(fp)]
+                else:
+                    units = _extract_generic_code_units(fp)
+                    if not units:
+                        units = [_fallback_file_unit(fp)]
                 rel_path_str = str(fp.relative_to(tmpdir)).replace("\\", "/")
                 try:
                     size_bytes = fp.stat().st_size
@@ -1350,7 +1620,7 @@ def build_repo_map(
                     {
                         "path": rel_path_str,
                         "size": size_bytes,
-                        "is_python": is_python,
+                        "language": "python" if is_python else _detect_language(fp),
                         "units": [
                             {
                                 "name": u["name"],
@@ -1359,7 +1629,7 @@ def build_repo_map(
                                 "end_line": u["end_line"],
                             }
                             for u in units
-                            if is_python
+                            if u.get("type") != "file"
                         ],
                     }
                 )

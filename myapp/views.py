@@ -166,6 +166,62 @@ Sections: {sections}
 Repository File List:
 {file_list}
 """
+
+    # Helper: attempt to extract & sanitize JSON from model output
+    def _extract_json_candidates(txt: str):
+        # Strip code fences if present
+        fenced = re.findall(r"```(?:json)?\n(.*?)```", txt, re.DOTALL | re.IGNORECASE)
+        if fenced:
+            for f in fenced:
+                yield f.strip()
+        # Bracket matching fallback
+        stack = []
+        start = None
+        for i, ch in enumerate(txt):
+            if ch == "{":
+                if start is None:
+                    start = i
+                stack.append(ch)
+            elif ch == "}" and stack:
+                stack.pop()
+                if not stack and start is not None:
+                    candidate = txt[start : i + 1]
+                    yield candidate.strip()
+                    start = None
+
+    def _clean_json(txt: str) -> str:
+        # Remove trailing commas before } or ]
+        txt = re.sub(r",\s*(\]|})", r"\1", txt)
+        # Replace single quotes around keys/values with double quotes (simple heuristic)
+        txt = re.sub(
+            r"'([^']*)'(?=\s*:)",
+            lambda m: '"' + m.group(1).replace('"', '\\"') + '"',
+            txt,
+        )
+        txt = re.sub(
+            r":\s*'([^']*)'",
+            lambda m: ': "' + m.group(1).replace('"', '\\"') + '"',
+            txt,
+        )
+        # Collapse duplicate whitespace
+        return txt.strip()
+
+    def _parse_identified(raw: str):
+        tried = set()
+        for cand in _extract_json_candidates(raw):
+            if cand in tried:
+                continue
+            tried.add(cand)
+            for attempt in range(2):  # raw then cleaned
+                attempt_txt = cand if attempt == 0 else _clean_json(cand)
+                try:
+                    obj = json.loads(attempt_txt)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    continue
+        return None
+
     try:
         llm_identify = ChatGoogleGenerativeAI(
             model=LLM_MODEL_NAME,
@@ -180,8 +236,18 @@ Repository File List:
         raw_response = chain_identify.invoke(
             {"file_list": file_list_str, "sections": json.dumps(sections_payload)}
         )
-        match = re.search(r"\{(?:.|\n)*\}", raw_response)
-        identified = json.loads(match.group(0)) if match else {}
+        identified = _parse_identified(raw_response) or {}
+        # If still empty, attempt a corrective second pass asking model to fix JSON
+        if not identified:
+            try:
+                fixer_prompt = ChatPromptTemplate.from_template(
+                    """You attempted to output JSON but it was invalid or empty. Below is your previous response.\nReturn ONLY a valid JSON object following the schema: mapping of section id -> array of file path strings.\nPrevious response:\n{previous}\n"""
+                )
+                fixer_chain = fixer_prompt | llm_identify | StrOutputParser()
+                fix_raw = fixer_chain.invoke({"previous": raw_response[:8000]})
+                identified = _parse_identified(fix_raw) or {}
+            except Exception:
+                pass
         result = {s["id"]: [] for s in sections}
         if isinstance(identified, dict):
             for sid, val in identified.items():
