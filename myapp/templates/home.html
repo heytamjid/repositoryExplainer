@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+{% load custom_filters %}
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -94,14 +95,30 @@
         </div>
     {% endif %}
 
+    {% if is_cached %}
+        <div class="cached-notice" style="background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+            <p>
+                Showing a cached summary for commit <strong>{{ cached_commit|slice:":7" }}</strong>.
+                <form method="post" style="display:inline; margin-left:10px;">
+                    {% csrf_token %}
+                    <input type="hidden" name="repo_url" value="{{ repo_url }}">
+                    <input type="hidden" name="force_resummarize" value="true">
+                    <button type="submit" style="background:none; border:none; color:#007bff; text-decoration:underline; cursor:pointer; padding:0; font-size:inherit;">Re-summarize Now</button>
+                </form>
+            </p>
+        </div>
+    {% endif %}
+
     {% if documentation %}
         <div class="documentation-container">
             <h2>Repository Documentation</h2>
-            {% for category, doc in documentation.items %}
-                <div class="category-block">
-                    <h3>{{ category }}</h3>
-                    <div>{{ doc|safe }}</div>
-                </div>
+            {% for section in sections %}
+                {% if documentation|get_item:section.id %}
+                    <div class="category-block">
+                        <h3>{{ section.title }}</h3>
+                        <div>{{ documentation|get_item:section.id|safe }}</div>
+                    </div>
+                {% endif %}
             {% endfor %}
         </div>
     {% endif %}

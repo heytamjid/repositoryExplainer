@@ -21,13 +21,14 @@ from . import embedder
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-LLM_MODEL_NAME = "gemini-1.5-flash"
+LLM_MODEL_NAME = "gemini-2.5-flash"
 LLM_TEMPERATURE_IDENTIFY = 0.1
 LLM_TEMPERATURE_GENERATE = 0.4
 MAX_TOTAL_CONTEXT_CHARS = 50000
 
 CHROMA_PERSIST_DIR = "chroma_persist"
 CHROMA_COLLECTION_NAME = "repo_functions"
+SUMMARY_CACHE_FILE = "summaries.json"
 
 SECTION_DEFINITIONS = [
     {
@@ -51,6 +52,36 @@ SECTION_DEFINITIONS = [
         "description": "ORM models, schemas, and database interaction layers.",
     },
 ]
+
+
+# --- Summary Cache Functions ---
+def read_summaries():
+    """Reads the entire summary cache file."""
+    if not os.path.exists(SUMMARY_CACHE_FILE):
+        return {}
+    try:
+        with open(SUMMARY_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (IOError, json.JSONDecodeError):
+        return {}
+
+
+def write_summary(repo_url, commit_hash, summary_data):
+    """Writes a summary for a specific repo to the cache file."""
+    summaries = read_summaries()
+    summaries[repo_url] = {
+        "timestamp": time.time(),
+        "commit": commit_hash,
+        "summary": summary_data,
+    }
+    with open(SUMMARY_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(summaries, f, indent=2)
+
+
+def get_summary(repo_url):
+    """Gets a specific summary from the cache."""
+    summaries = read_summaries()
+    return summaries.get(repo_url)
 
 
 # --- GitHub API Functions (No changes here) ---
@@ -238,26 +269,51 @@ Follow these rules strictly:
 
 
 def home(request):
-    # ... (code is unchanged)
     documentation = None
     error = None
     repo_url = ""
+    cached_commit = None
+    is_cached = False
+
     if request.method == "POST":
         repo_url = request.POST.get("repo_url")
+        force_resummarize = request.POST.get("force_resummarize") == "true"
+
         if repo_url:
             if not GITHUB_TOKEN or not GOOGLE_API_KEY:
                 error = "Server configuration error: API keys are missing."
             else:
-                repo_tree = fetch_repo_tree(repo_url)
-                if repo_tree:
-                    files_by_category = get_important_files_by_category(
-                        repo_tree, SECTION_DEFINITIONS
-                    )
-                    documentation = generate_documentation(
-                        repo_url, files_by_category, SECTION_DEFINITIONS
-                    )
+                cached_summary = get_summary(repo_url)
+                if cached_summary and not force_resummarize:
+                    print(f"Displaying cached summary for {repo_url}")
+                    documentation = cached_summary.get("summary")
+                    cached_commit = cached_summary.get("commit")
+                    is_cached = True
                 else:
-                    error = "Could not fetch the repository file structure. Please check the URL."
+                    print(f"Generating new summary for {repo_url}")
+                    repo_tree = fetch_repo_tree(repo_url)
+                    if repo_tree:
+                        # Get the latest commit hash to store with the summary
+                        owner, repo = parse_github_url(repo_url)
+                        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+                        repo_api = f"https://api.github.com/repos/{owner}/{repo}"
+                        repo_info = requests.get(repo_api, headers=headers).json()
+                        default_branch = repo_info.get("default_branch", "main")
+                        ref_url = f"{repo_api}/git/refs/heads/{default_branch}"
+                        ref = requests.get(ref_url, headers=headers).json()
+                        latest_commit = ref.get("object", {}).get("sha")
+
+                        files_by_category = get_important_files_by_category(
+                            repo_tree, SECTION_DEFINITIONS
+                        )
+                        documentation = generate_documentation(
+                            repo_url, files_by_category, SECTION_DEFINITIONS
+                        )
+                        if latest_commit and documentation:
+                            write_summary(repo_url, latest_commit, documentation)
+                    else:
+                        error = "Could not fetch the repository file structure. Please check the URL."
+
     return render(
         request,
         "home.html",
@@ -266,6 +322,8 @@ def home(request):
             "error": error,
             "repo_url": repo_url,
             "sections": SECTION_DEFINITIONS,
+            "is_cached": is_cached,
+            "cached_commit": cached_commit,
         },
     )
 

@@ -259,6 +259,29 @@ def index_repository(
 
         texts_to_embed, metadata_for_text = [], []
 
+        # --- Embed Summary ---
+        from myapp.views import get_summary  # Local import to avoid circular dependency
+
+        summary_data = get_summary(repo_url)
+        if summary_data and summary_data.get("summary"):
+            print("Embedding repository summary...")
+            summary = summary_data["summary"]
+            for section_id, content in summary.items():
+                doc = f"Summary of Section: {section_id}\n\n{content}"
+                texts_to_embed.append(doc)
+                metadata_for_text.append(
+                    {
+                        "repo_url": repo_url,
+                        "commit": summary_data.get("commit"),
+                        "file_path": "repository-summary.md",
+                        "unit_name": f"Summary: {section_id}",
+                        "unit_type": "summary",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "chunk_index": 0,
+                    }
+                )
+
         # Create a temporary file for logging what's being embedded
         log_file_path = tmpdir / "embedding_log.txt"
         with log_file_path.open("w", encoding="utf-8") as log_f:
@@ -351,7 +374,7 @@ def query_repository(
     repo_url: str,
     persist_dir: str = "chroma_persist",
     collection_name: str = "repo_functions",
-    top_k: int = 5,
+    top_k: int = 25,
 ) -> List[Dict]:
     """Queries the vector store for relevant code chunks."""
     try:
