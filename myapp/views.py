@@ -274,6 +274,7 @@ def home(request):
     repo_url = ""
     cached_commit = None
     is_cached = False
+    embedding_info = embedder.get_embedding_info()
 
     if request.method == "POST":
         repo_url = request.POST.get("repo_url")
@@ -324,6 +325,7 @@ def home(request):
             "sections": SECTION_DEFINITIONS,
             "is_cached": is_cached,
             "cached_commit": cached_commit,
+            "embedding_info": embedding_info,
         },
     )
 
@@ -331,7 +333,15 @@ def home(request):
 def ask_question(request):
     # ... (code is unchanged)
     repo_url = request.GET.get("repo_url", "")
-    return render(request, "ask.html", {"repo_url": repo_url})
+    embedding_info = embedder.get_embedding_info()
+    return render(
+        request,
+        "ask.html",
+        {
+            "repo_url": repo_url,
+            "embedding_info": embedding_info,
+        },
+    )
 
 
 @csrf_exempt
@@ -343,15 +353,28 @@ def api_ask(request):
         body = json.loads(request.body.decode("utf-8"))
         question = body.get("question", "").strip()
         repo_url = body.get("repo_url", "").strip()
-        action = body.get("action", "ask")  # New: 'ask' or 'start_indexing'
+        action = body.get("action", "ask")  # 'ask', 'start_indexing', or 'get_config'
+        embedding_mode = body.get("embedding_mode")  # Optional embedding mode override
     except json.JSONDecodeError:
         return HttpResponseBadRequest("Invalid JSON")
 
-    if not repo_url:
+    if not repo_url and action != "get_config":
         return JsonResponse({"answer": "A repository URL is required."})
 
+    # Handle configuration requests
+    if action == "get_config":
+        return JsonResponse(
+            {
+                "embedding_info": embedder.get_embedding_info(),
+                "status": "config_retrieved",
+            }
+        )
+
+    # Handle indexing requests
     if action == "start_indexing":
         print(f"Received request to start indexing for {repo_url}")
+        if embedding_mode:
+            print(f"Using embedding mode: {embedding_mode}")
 
         def _start_index_task():
             print(f"Starting indexing thread for {repo_url}")
@@ -360,14 +383,21 @@ def api_ask(request):
                     repo_url,
                     persist_dir=CHROMA_PERSIST_DIR,
                     collection_name=CHROMA_COLLECTION_NAME,
+                    embedding_mode=embedding_mode,
                 )
                 print("Background indexing result:", res)
             except Exception as e:
                 print(f"Indexing thread for {repo_url} failed: {e}")
 
         threading.Thread(target=_start_index_task, daemon=True).start()
-        return JsonResponse({"status": "indexing_started"})
+        return JsonResponse(
+            {
+                "status": "indexing_started",
+                "embedding_mode": embedding_mode or embedder.EMBEDDING_MODE,
+            }
+        )
 
+    # Handle question answering
     if not question:
         return JsonResponse({"answer": "A question is required."})
 
@@ -387,14 +417,16 @@ def api_ask(request):
     if repo_status == "running":
         return JsonResponse(
             {
-                "answer": "Repository is currently being indexed. Please try again in a few moments."
+                "answer": "Repository is currently being indexed. Please try again in a few moments.",
+                "status": "indexing_in_progress",
             }
         )
 
     if repo_status != "done":
         return JsonResponse(
             {
-                "answer": "This repository has not been indexed yet. Please click the 'Index Repository' button first."
+                "answer": "This repository has not been indexed yet. Please click the 'Index Repository' button first.",
+                "status": "not_indexed",
             }
         )
 
@@ -405,12 +437,14 @@ def api_ask(request):
             repo_url,
             persist_dir=CHROMA_PERSIST_DIR,
             collection_name=CHROMA_COLLECTION_NAME,
+            embedding_mode=embedding_mode,
         )
 
         if not retrieved_docs:
             return JsonResponse(
                 {
-                    "answer": "I could not find relevant information in the repository to answer this question."
+                    "answer": "I could not find relevant information in the repository to answer this question.",
+                    "status": "no_results",
                 }
             )
 
@@ -421,10 +455,11 @@ def api_ask(request):
             context += doc["document"]
             context += f"\n--- End ---\n\n"
 
-        # ## ADDED ##: Cleanly print the full context to the console for scrutiny.
+        # Cleanly print the full context to the console for scrutiny.
         print("\n" + "=" * 80)
         print(" FULL CONTEXT FOR SCRUTINY ".center(80, "="))
         print(f"QUERY: {question}")
+        print(f"EMBEDDING MODE: {embedding_mode or embedder.EMBEDDING_MODE}")
         print("-" * 80)
         print(context)
         print("=" * 80 + "\n")
@@ -444,10 +479,107 @@ def api_ask(request):
         chain = prompt_template | llm | StrOutputParser()
         answer = chain.invoke({"question": question, "context": context})
 
-        return JsonResponse({"answer": markdown2.markdown(answer)})
+        return JsonResponse(
+            {
+                "answer": markdown2.markdown(answer),
+                "status": "success",
+                "embedding_mode": repo_status_data.get("embedding_mode", "unknown"),
+                "num_results": len(retrieved_docs),
+            }
+        )
 
     except Exception as e:
         print(f"Error during question answering: {e}")
         return JsonResponse(
-            {"answer": f"An error occurred while processing your question: {str(e)}"}
+            {
+                "answer": f"An error occurred while processing your question: {str(e)}",
+                "status": "error",
+            }
         )
+
+
+@csrf_exempt
+def api_embedding_config(request):
+    """API endpoint to get and set embedding configuration."""
+    if request.method == "GET":
+        return JsonResponse(embedder.get_embedding_info())
+
+    elif request.method == "POST":
+        try:
+            body = json.loads(request.body.decode("utf-8"))
+            action = body.get("action")
+
+            if action == "set_mode":
+                new_mode = body.get("mode")
+                if new_mode in ["local", "remote"]:
+                    # Update environment variable (note: this only affects current process)
+                    os.environ["EMBEDDING_MODE"] = new_mode
+                    embedder.EMBEDDING_MODE = new_mode
+                    return JsonResponse(
+                        {
+                            "status": "success",
+                            "message": f"Embedding mode set to {new_mode}",
+                            "embedding_info": embedder.get_embedding_info(),
+                        }
+                    )
+                else:
+                    return JsonResponse(
+                        {
+                            "status": "error",
+                            "message": "Invalid embedding mode. Use 'local' or 'remote'.",
+                        }
+                    )
+
+            elif action == "test_local":
+                try:
+                    # Test if local embedding model can be loaded
+                    test_embeddings = embedder.get_embeddings_local(["test"])
+                    return JsonResponse(
+                        {
+                            "status": "success",
+                            "message": "Local embedding model is working",
+                            "embedding_dimension": len(test_embeddings[0]),
+                        }
+                    )
+                except Exception as e:
+                    return JsonResponse(
+                        {
+                            "status": "error",
+                            "message": f"Local embedding model test failed: {str(e)}",
+                        }
+                    )
+
+            elif action == "test_remote":
+                try:
+                    # Test if remote embedding API is working
+                    test_embeddings = embedder.get_embeddings_remote(
+                        ["test"], "RETRIEVAL_QUERY"
+                    )
+                    return JsonResponse(
+                        {
+                            "status": "success",
+                            "message": "Remote embedding API is working",
+                            "embedding_dimension": len(test_embeddings[0]),
+                        }
+                    )
+                except Exception as e:
+                    return JsonResponse(
+                        {
+                            "status": "error",
+                            "message": f"Remote embedding API test failed: {str(e)}",
+                        }
+                    )
+
+            else:
+                return JsonResponse(
+                    {
+                        "status": "error",
+                        "message": "Invalid action. Use 'set_mode', 'test_local', or 'test_remote'.",
+                    }
+                )
+
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest("Invalid JSON")
+
+    else:
+        return HttpResponseBadRequest("GET or POST required")

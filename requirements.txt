@@ -11,3 +11,9 @@ PyGithub
 python-dotenv
 requests
 sqlalchemy
+sentence-transformers 
+torch
+transformers
+numpy 
+einops
+hf_xet

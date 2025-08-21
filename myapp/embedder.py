@@ -14,15 +14,26 @@ import chromadb
 import ast
 
 # --- Configuration ---
-# ## MODIFIED ##: Corrected the model name to the official one.
-EMBEDDING_MODEL = "models/embedding-001"
+# Embedding Configuration
+EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "local")  # "local" or "remote"
+LOCAL_EMBEDDING_MODEL = (
+    "nomic-ai/nomic-embed-text-v1.5"  # Nomic model for local embedding
+)
+REMOTE_EMBEDDING_MODEL = "models/embedding-001"  # Google Gemini model
 EMBEDDING_TASK_TYPE = Literal["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"]
 EMBEDDING_BATCH_SIZE = 100
-EMBEDDING_DIMENSIONS = 768
+EMBEDDING_DIMENSIONS = 768  # This may vary based on the model
+LOCAL_EMBEDDING_DEVICE = os.environ.get(
+    "LOCAL_EMBEDDING_DEVICE", "cpu"
+)  # "cpu" or "cuda"
 
 # --- Module-level State Management ---
 STATUS_FILE_NAME = "indexing_status.json"
 _index_lock = threading.Lock()
+
+# Global variables for local embedding model (lazy loading)
+_local_model = None
+_local_tokenizer = None
 
 
 def _get_status_path(persist_dir: str) -> Path:
@@ -68,6 +79,151 @@ def get_indexing_status(repo_url: str, persist_dir: str = "chroma_persist") -> D
     status_path = _get_status_path(persist_dir)
     statuses = _read_status(status_path)
     return statuses.get(repo_url, {"status": "not_indexed"})
+
+
+def _load_local_embedding_model():
+    """Lazy loading of the local embedding model."""
+    global _local_model, _local_tokenizer
+
+    if _local_model is not None:
+        return _local_model, _local_tokenizer
+
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        print(f"Loading local embedding model: {LOCAL_EMBEDDING_MODEL}")
+        _local_model = SentenceTransformer(
+            LOCAL_EMBEDDING_MODEL,
+            device=LOCAL_EMBEDDING_DEVICE,
+            trust_remote_code=True,
+        )
+        print(f"Local embedding model loaded successfully on {LOCAL_EMBEDDING_DEVICE}")
+        return _local_model, None
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers is required for local embeddings. "
+            "Install it with: pip install sentence-transformers"
+        )
+    except Exception as e:
+        raise Exception(f"Failed to load local embedding model: {e}")
+
+
+def get_embeddings_local(texts: List[str]) -> List[List[float]]:
+    """
+    Gets embeddings for a list of texts using the local Nomic model.
+    """
+    model, _ = _load_local_embedding_model()
+
+    print(f"Processing {len(texts)} texts with local embedding model...")
+
+    # Process in batches for memory efficiency
+    all_embeddings = []
+    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch_texts = texts[i : i + EMBEDDING_BATCH_SIZE]
+        print(
+            f"Processing local embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
+        )
+
+        try:
+            # Encode the batch
+            batch_embeddings = model.encode(
+                batch_texts,
+                convert_to_tensor=False,
+                show_progress_bar=False,
+                normalize_embeddings=True,  # Normalize for better similarity search
+            )
+            all_embeddings.extend(batch_embeddings.tolist())
+
+            # Small delay to prevent overheating
+            if len(batch_texts) == EMBEDDING_BATCH_SIZE:
+                time.sleep(0.1)
+
+        except Exception as e:
+            print(f"Fatal error embedding batch locally: {e}. Stopping indexing.")
+            raise e
+
+    return all_embeddings
+
+
+def get_embeddings_remote(
+    texts: List[str], task_type: EMBEDDING_TASK_TYPE
+) -> List[List[float]]:
+    """
+    Gets embeddings for a list of texts using the Google Generative AI API.
+    """
+    import requests
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY environment variable not set")
+
+    all_embeddings = []
+
+    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch_texts = texts[i : i + EMBEDDING_BATCH_SIZE]
+
+        print(
+            f"Processing remote embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
+        )
+
+        requests_payload = [
+            {
+                "model": REMOTE_EMBEDDING_MODEL,
+                "content": {"parts": [{"text": text}]},
+                "taskType": task_type,
+            }
+            for text in batch_texts
+        ]
+
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{REMOTE_EMBEDDING_MODEL.split('/')[1]}:batchEmbedContents?key={api_key}"
+            headers = {"Content-Type": "application/json"}
+            data = {"requests": requests_payload}
+
+            response = requests.post(url, json=data, headers=headers, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+
+            batch_embeddings = [item["values"] for item in result["embeddings"]]
+            all_embeddings.extend(batch_embeddings)
+
+            # Increased sleep time to avoid hitting API rate limits.
+            # A 4-second delay respects a 15 requests-per-minute limit.
+            print("Waiting for 4 seconds to respect API rate limits...")
+            time.sleep(4)
+
+        except Exception as e:
+            print(f"Fatal error embedding batch: {e}. Stopping indexing.")
+            raise e
+
+    return all_embeddings
+
+
+def get_embeddings(
+    texts: List[str],
+    task_type: EMBEDDING_TASK_TYPE = "RETRIEVAL_DOCUMENT",
+    mode: Optional[str] = None,
+) -> List[List[float]]:
+    """
+    Gets embeddings for a list of texts using either local or remote model.
+
+    Args:
+        texts: List of texts to embed
+        task_type: Task type for remote embeddings (ignored for local)
+        mode: Override the global EMBEDDING_MODE ("local" or "remote")
+    """
+    embedding_mode = mode or EMBEDDING_MODE
+
+    print(f"Using {embedding_mode} embeddings for {len(texts)} texts")
+
+    if embedding_mode == "local":
+        return get_embeddings_local(texts)
+    elif embedding_mode == "remote":
+        return get_embeddings_remote(texts, task_type)
+    else:
+        raise ValueError(
+            f"Invalid embedding mode: {embedding_mode}. Use 'local' or 'remote'"
+        )
 
 
 def _read_gitignore(repo_path: Path) -> Optional[pathspec.PathSpec]:
@@ -158,69 +314,62 @@ def _chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> List[st
     return chunks
 
 
-def get_embeddings(
-    texts: List[str], task_type: EMBEDDING_TASK_TYPE
-) -> List[List[float]]:
+def _write_chunks_manifest(
+    persist_dir: str,
+    repo_url: str,
+    texts: List[str],
+    metadatas: List[Dict],
+    filename: Optional[str] = None,
+) -> Path:
     """
-    Gets embeddings for a list of texts using the Google Generative AI API.
+    Write a newline-delimited JSON manifest listing all chunks that will be embedded.
+    Each line contains metadata plus the chunk text and a content hash for inspection.
+    Returns the Path to the created manifest file.
     """
-    import requests
+    dest = Path(persist_dir)
+    dest.mkdir(parents=True, exist_ok=True)
 
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY environment variable not set")
+    safe_repo = repo_url.replace("://", "_").replace("/", "_").replace(":", "_")
+    manifest_name = filename or f"{safe_repo}_embedding_chunks.jsonl"
+    manifest_path = dest / manifest_name
 
-    all_embeddings = []
-
-    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch_texts = texts[i : i + EMBEDDING_BATCH_SIZE]
-
-        print(
-            f"Processing embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
-        )
-
-        requests_payload = [
-            {
-                "model": EMBEDDING_MODEL,
-                "content": {"parts": [{"text": text}]},
-                "taskType": task_type,
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        for text, meta in zip(texts, metadatas):
+            rec = {
+                "file_path": meta.get("file_path"),
+                "unit_name": meta.get("unit_name"),
+                "unit_type": meta.get("unit_type"),
+                "start_line": meta.get("start_line"),
+                "end_line": meta.get("end_line"),
+                "chunk_index": meta.get("chunk_index"),
+                "char_len": len(text) if text is not None else 0,
+                "hash": _hash_text(text or ""),
+                "text": text,
             }
-            for text in batch_texts
-        ]
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL.split('/')[1]}:batchEmbedContents?key={api_key}"
-            headers = {"Content-Type": "application/json"}
-            data = {"requests": requests_payload}
-
-            response = requests.post(url, json=data, headers=headers, timeout=60)
-            response.raise_for_status()
-            result = response.json()
-
-            batch_embeddings = [item["values"] for item in result["embeddings"]]
-            all_embeddings.extend(batch_embeddings)
-
-            # ## MODIFIED ##: Increased sleep time to avoid hitting API rate limits.
-            # A 4-second delay respects a 15 requests-per-minute limit.
-            print("Waiting for 4 seconds to respect API rate limits...")
-            time.sleep(4)
-
-        except Exception as e:
-            # ## MODIFIED ##: Removed zero-vector fallback.
-            # Now, if an error occurs, we print it and re-raise the exception
-            # to stop the indexing process immediately.
-            print(f"Fatal error embedding batch: {e}. Stopping indexing.")
-            raise e
-
-    return all_embeddings
+    return manifest_path
 
 
 def index_repository(
     repo_url: str,
     persist_dir: str = "chroma_persist",
     collection_name: str = "repo_functions",
+    embedding_mode: Optional[str] = None,
 ) -> Dict:
-    """Clones a repo, extracts code units, embeds them, and persists to ChromaDB."""
+    """
+    Clones a repo, extracts code units, embeds them, and persists to ChromaDB.
+
+    Args:
+        repo_url: URL of the repository to index
+        persist_dir: Directory to persist ChromaDB
+        collection_name: Name of the ChromaDB collection
+        embedding_mode: Override global embedding mode ("local" or "remote")
+    """
+    # Use the specified mode or fall back to global setting
+    mode = embedding_mode or EMBEDDING_MODE
+    print(f"Indexing repository with {mode} embeddings")
+
     status_path = _get_status_path(persist_dir)
     statuses = _read_status(status_path)
     repo_status = statuses.get(repo_url, {})
@@ -237,7 +386,11 @@ def index_repository(
             return {"status": "already_running"}
 
     # Set status to running
-    statuses[repo_url] = {"status": "running", "start_time": time.time()}
+    statuses[repo_url] = {
+        "status": "running",
+        "start_time": time.time(),
+        "embedding_mode": mode,
+    }
     _write_status(status_path, statuses)
 
     # Clean up previous failed attempts for this repo
@@ -279,6 +432,7 @@ def index_repository(
                         "start_line": 1,
                         "end_line": 1,
                         "chunk_index": 0,
+                        "embedding_mode": mode,
                     }
                 )
 
@@ -320,6 +474,7 @@ def index_repository(
                                     "start_line": u["start_line"],
                                     "end_line": u["end_line"],
                                     "chunk_index": idx,
+                                    "embedding_mode": mode,
                                 }
                             )
                             log_f.write(f"--- Document ---\n{doc}\n\n")
@@ -329,12 +484,25 @@ def index_repository(
                 "status": "done",
                 "commit": commit,
                 "indexed_chunks": 0,
+                "embedding_mode": mode,
             }
             _write_status(status_path, statuses)
             return {"status": "ok", "commit": commit, "indexed_chunks": 0}
 
-        print(f"Starting to embed {len(texts_to_embed)} text chunks...")
-        embeddings = get_embeddings(texts_to_embed, "RETRIEVAL_DOCUMENT")
+        print(
+            f"Starting to embed {len(texts_to_embed)} text chunks using {mode} embeddings..."
+        )
+
+        # Write a manifest of all chunks that will be embedded for inspection/debugging
+        try:
+            manifest_path = _write_chunks_manifest(
+                persist_dir, repo_url, texts_to_embed, metadata_for_text
+            )
+            print(f"Wrote embedding manifest to: {manifest_path}")
+        except Exception as e:
+            print(f"Warning: failed to write chunks manifest: {e}")
+
+        embeddings = get_embeddings(texts_to_embed, "RETRIEVAL_DOCUMENT", mode)
 
         ids = [
             f"{m['repo_url']}:{m['file_path']}:{m['unit_name']}:{m['start_line']}:{m['chunk_index']}"
@@ -354,6 +522,7 @@ def index_repository(
             "status": "done",
             "commit": commit,
             "indexed_chunks": len(ids),
+            "embedding_mode": mode,
         }
         _write_status(status_path, statuses)
 
@@ -375,8 +544,22 @@ def query_repository(
     persist_dir: str = "chroma_persist",
     collection_name: str = "repo_functions",
     top_k: int = 25,
+    embedding_mode: Optional[str] = None,
 ) -> List[Dict]:
-    """Queries the vector store for relevant code chunks."""
+    """
+    Queries the vector store for relevant code chunks.
+
+    Args:
+        question: The question to search for
+        repo_url: URL of the repository to query
+        persist_dir: Directory where ChromaDB is persisted
+        collection_name: Name of the ChromaDB collection
+        top_k: Number of results to return
+        embedding_mode: Override global embedding mode ("local" or "remote")
+    """
+    # Use the specified mode or fall back to global setting
+    mode = embedding_mode or EMBEDDING_MODE
+
     try:
         client = chromadb.PersistentClient(path=persist_dir)
         collection = client.get_collection(collection_name)
@@ -385,7 +568,7 @@ def query_repository(
         return []
 
     try:
-        query_embedding = get_embeddings([question], "RETRIEVAL_QUERY")[0]
+        query_embedding = get_embeddings([question], "RETRIEVAL_QUERY", mode)[0]
     except Exception as e:
         print(f"Failed to embed query: {e}")
         return []
@@ -402,3 +585,17 @@ def query_repository(
     docs = results["documents"][0]
     metadatas = results["metadatas"][0]
     return [{"document": doc, "metadata": meta} for doc, meta in zip(docs, metadatas)]
+
+
+def get_embedding_info() -> Dict:
+    """
+    Returns information about the current embedding configuration.
+    """
+    return {
+        "mode": EMBEDDING_MODE,
+        "local_model": LOCAL_EMBEDDING_MODEL,
+        "remote_model": REMOTE_EMBEDDING_MODEL,
+        "device": LOCAL_EMBEDDING_DEVICE,
+        "batch_size": EMBEDDING_BATCH_SIZE,
+        "dimensions": EMBEDDING_DIMENSIONS,
+    }
