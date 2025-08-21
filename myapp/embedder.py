@@ -31,6 +31,135 @@ LOCAL_EMBEDDING_DEVICE = os.environ.get(
 STATUS_FILE_NAME = "indexing_status.json"
 _index_lock = threading.Lock()
 
+# --- File exclusion / denylist configuration ---
+# Extensions, filenames and directory names we never want to index
+DENY_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".mp4",
+    ".mp3",
+    ".wav",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".exe",
+    ".dll",
+    ".so",
+    ".pyc",
+    ".class",
+    ".jar",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+}
+
+# Specific file names to always skip
+DENY_FILENAMES = {"db.sqlite3", "thumbs.db"}
+
+# Directory names that are commonly noisy
+DENY_DIR_NAMES = {
+    "node_modules",
+    "venv",
+    ".venv",
+    "env",
+    "build",
+    "dist",
+    "target",
+    "out",
+    "public",
+    "static",
+    "media",
+    "__pycache__",
+    "coverage",
+    "vendor",
+    "bower_components",
+    ".next",
+    ".nuxt",
+    "django_bundles",
+    "django_bundle",
+}
+
+# Max file size (bytes) to consider for indexing (default 200 KB)
+MAX_FILE_SIZE_BYTES = int(os.environ.get("REPO_EXPLAINER_MAX_FILE_SIZE", 200 * 1024))
+
+
+# Small helper to heuristically detect binary files by sampling the beginning bytes
+def _is_probably_binary(path: Path, sample_size: int = 4096) -> bool:
+    try:
+        with path.open("rb") as fh:
+            chunk = fh.read(sample_size)
+            if not chunk:
+                return False
+            # Null byte is a strong signal of binary
+            if b"\x00" in chunk:
+                return True
+            # Heuristic: proportion of non-text bytes
+            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
+            nontext = sum(1 for b in chunk if b not in text_chars)
+            return (nontext / max(1, len(chunk))) > 0.30
+    except Exception:
+        # If we cannot read the file, be conservative and skip it
+        return True
+
+
+def _should_skip_file(
+    path: Path, repo_root: Path, gitignore_spec: Optional[pathspec.PathSpec]
+) -> bool:
+    """
+    Return True if the file should be skipped from indexing.
+    Checks: .gitignore, denylist by extension/filename/dir, file size, and a binary heuristic.
+    """
+    try:
+        if not path.exists() or path.is_dir():
+            return True
+
+        rel = str(path.relative_to(repo_root)).replace("\\", "/")
+
+        # Respect .gitignore
+        if gitignore_spec and gitignore_spec.match_file(rel):
+            return True
+
+        name_lower = path.name.lower()
+        if name_lower in DENY_FILENAMES:
+            return True
+
+        # Skip files inside noisy dirs (any path component matches)
+        for p in path.parts:
+            if p.lower() in DENY_DIR_NAMES:
+                return True
+
+        # Skip by extension
+        ext = path.suffix.lower()
+        if ext in DENY_EXTENSIONS:
+            return True
+
+        # Skip very large files
+        try:
+            size = path.stat().st_size
+            if size > MAX_FILE_SIZE_BYTES:
+                return True
+        except Exception:
+            return True
+
+        # Heuristic: skip binary-like files
+        if _is_probably_binary(path):
+            return True
+
+        return False
+    except Exception:
+        return True
+
+
 # Global variables for local embedding model (lazy loading)
 _local_model = None
 _local_tokenizer = None
@@ -446,7 +575,9 @@ def index_repository(
                     continue
                 for fn in files:
                     fp = rootp / fn
-                    if _is_ignored(fp, tmpdir, spec):
+                    # Combined skip logic: respect .gitignore, denylist, binary/size heuristics
+                    if _should_skip_file(fp, tmpdir, spec):
+                        log_f.write(f"SKIPPED: {fp.relative_to(tmpdir)}\n")
                         continue
 
                     units = (
@@ -598,4 +729,8 @@ def get_embedding_info() -> Dict:
         "device": LOCAL_EMBEDDING_DEVICE,
         "batch_size": EMBEDDING_BATCH_SIZE,
         "dimensions": EMBEDDING_DIMENSIONS,
+        "deny_extensions": sorted(list(DENY_EXTENSIONS)),
+        "deny_filenames": sorted(list(DENY_FILENAMES)),
+        "deny_dir_names": sorted(list(DENY_DIR_NAMES)),
+        "max_file_size_bytes": MAX_FILE_SIZE_BYTES,
     }
