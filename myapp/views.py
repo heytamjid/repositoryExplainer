@@ -432,34 +432,38 @@ def api_ask(request):
 
     try:
         print(f"Repository {repo_url} is indexed. Querying for: '{question}'")
-        retrieved_docs = embedder.query_repository(
+        adv = embedder.query_repository_advanced(
             question,
             repo_url,
             persist_dir=CHROMA_PERSIST_DIR,
             collection_name=CHROMA_COLLECTION_NAME,
             embedding_mode=embedding_mode,
         )
+        retrieved_docs = adv.get("documents", [])
+        classification = adv.get("classification")
 
         if not retrieved_docs:
             return JsonResponse(
                 {
                     "answer": "I could not find relevant information in the repository to answer this question.",
                     "status": "no_results",
+                    "classification": classification,
                 }
             )
 
-        context = "Context from repository:\n"
+        context = f"Query classification: {classification}\n\nContext from repository grouped by file:\n"
         for doc in retrieved_docs:
             metadata = doc["metadata"]
-            context += f"--- Start: {metadata['file_path']} (Lines: {metadata['start_line']}-{metadata['end_line']}) ---\n"
+            context += f"=== FILE: {metadata['file_path']} (Lines: {metadata['start_line']}-{metadata['end_line']}) ===\n"
             context += doc["document"]
-            context += f"\n--- End ---\n\n"
+            context += f"\n\n"
 
         # Cleanly print the full context to the console for scrutiny.
         print("\n" + "=" * 80)
         print(" FULL CONTEXT FOR SCRUTINY ".center(80, "="))
         print(f"QUERY: {question}")
         print(f"EMBEDDING MODE: {embedding_mode or embedder.EMBEDDING_MODE}")
+        print(f"CLASSIFICATION: {classification}")
         print("-" * 80)
         print(context)
         print("=" * 80 + "\n")
@@ -485,6 +489,7 @@ def api_ask(request):
                 "status": "success",
                 "embedding_mode": repo_status_data.get("embedding_mode", "unknown"),
                 "num_results": len(retrieved_docs),
+                "classification": classification,
             }
         )
 

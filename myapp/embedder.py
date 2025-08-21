@@ -4,7 +4,7 @@ import hashlib
 import json
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Optional, Literal
+from typing import List, Dict, Optional, Literal, Tuple
 import threading
 import subprocess
 import time
@@ -14,7 +14,7 @@ import chromadb
 import ast
 
 # --- Configuration ---
-# Embedding Configuration
+# Embedding Configuration (unit-level and file-level)
 EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "local")  # "local" or "remote"
 LOCAL_EMBEDDING_MODEL = (
     "nomic-ai/nomic-embed-text-v1.5"  # Nomic model for local embedding
@@ -26,6 +26,27 @@ EMBEDDING_DIMENSIONS = 768  # This may vary based on the model
 LOCAL_EMBEDDING_DEVICE = os.environ.get(
     "LOCAL_EMBEDDING_DEVICE", "cpu"
 )  # "cpu" or "cuda"
+
+# File-level dual indexing configuration
+FILE_LEVEL_MAX_CHARS = int(os.environ.get("REPO_EXPLAINER_FILE_MAX_CHARS", 8000))
+FILE_LEVEL_WINDOW_TARGET = int(
+    os.environ.get("REPO_EXPLAINER_FILE_WINDOW_CHARS", 4000)
+)  # Target size for windowed file chunks
+FILE_LEVEL_OVERLAP_FUNCTIONS = int(
+    os.environ.get("REPO_EXPLAINER_FILE_OVERLAP_FUNCS", 1)
+)  # Number of functions to overlap between large file windows
+MAX_TOTAL_GROUPED_CONTEXT_CHARS = int(
+    os.environ.get("REPO_EXPLAINER_MAX_TOTAL_GROUPED", 60000)
+)
+
+# Retrieval tuning
+HIGH_LEVEL_TOP_K_FILES = int(os.environ.get("REPO_EXPLAINER_TOP_K_FILES", 8))
+HIGH_LEVEL_UNIT_PER_FILE = int(os.environ.get("REPO_EXPLAINER_UNITS_PER_FILE", 6))
+
+# Classifier model (separate from embedding model so we don't interfere with primary embedding pipeline)
+CLASSIFIER_MODEL_NAME = os.environ.get(
+    "REPO_EXPLAINER_CLASSIFIER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # --- Module-level State Management ---
 STATUS_FILE_NAME = "indexing_status.json"
@@ -163,6 +184,7 @@ def _should_skip_file(
 # Global variables for local embedding model (lazy loading)
 _local_model = None
 _local_tokenizer = None
+_classifier_model = None
 
 
 def _get_status_path(persist_dir: str) -> Path:
@@ -235,6 +257,27 @@ def _load_local_embedding_model():
         )
     except Exception as e:
         raise Exception(f"Failed to load local embedding model: {e}")
+
+
+def _load_classifier_model():
+    """Lazy load the light-weight sentence-transformers classifier model."""
+    global _classifier_model
+    if _classifier_model is not None:
+        return _classifier_model
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        print(f"Loading classifier model: {CLASSIFIER_MODEL_NAME}")
+        _classifier_model = SentenceTransformer(
+            CLASSIFIER_MODEL_NAME, device="cpu", trust_remote_code=True
+        )
+        return _classifier_model
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers is required for query classification. Install it with: pip install sentence-transformers"
+        )
+    except Exception as e:
+        raise Exception(f"Failed to load classifier model: {e}")
 
 
 def get_embeddings_local(texts: List[str]) -> List[List[float]]:
@@ -429,6 +472,70 @@ def _fallback_file_unit(path: Path) -> Dict:
     }
 
 
+def _group_units_into_file_chunks(
+    path: Path, units: List[Dict]
+) -> List[Tuple[str, int, int, int]]:
+    """
+    Create file-level chunks (dual indexing) without breaking function/class boundaries.
+    Returns list of tuples: (chunk_text, chunk_index, start_line, end_line)
+    """
+    try:
+        full_src = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    if not units:
+        # Fall back to simple chunking of entire file text
+        chunks = []
+        texts = _chunk_text(full_src, max_chars=FILE_LEVEL_WINDOW_TARGET, overlap=200)
+        for i, t in enumerate(texts):
+            chunks.append((t, i, 1, len(full_src.splitlines())))
+        return chunks
+
+    # Single chunk if file small enough
+    if len(full_src) <= FILE_LEVEL_MAX_CHARS:
+        return [(full_src, 0, 1, len(full_src.splitlines()))]
+
+    # Otherwise group sequential units into chunks up to FILE_LEVEL_WINDOW_TARGET chars
+    chunks: List[Tuple[str, int, int, int]] = []
+    current_parts: List[str] = []
+    current_start = units[0]["start_line"]
+    current_chars = 0
+    chunk_index = 0
+
+    def flush(end_line: int):
+        nonlocal current_parts, current_chars, current_start, chunk_index
+        if not current_parts:
+            return
+        text = "\n\n".join(current_parts)
+        chunks.append((text, chunk_index, current_start, end_line))
+        chunk_index += 1
+        current_parts = []
+        current_chars = 0
+        current_start = end_line + 1
+
+    for i, u in enumerate(units):
+        block = u["code"].rstrip()
+        sep = f"\n\n# ---- {u['type'].upper()} {u['name']} (lines {u['start_line']}-{u['end_line']}) ----\n"
+        block_text = sep + block
+        if current_chars + len(block_text) > FILE_LEVEL_WINDOW_TARGET and current_parts:
+            # Overlap last few functions: add tail from previous before flush (handled implicitly via last_parts)
+            flush(units[i - 1]["end_line"])
+            # Start new chunk, optionally overlap previous N functions
+            if FILE_LEVEL_OVERLAP_FUNCTIONS > 0 and i > 0:
+                overlap_units = units[max(0, i - FILE_LEVEL_OVERLAP_FUNCTIONS) : i]
+                for ou in overlap_units:
+                    osep = f"\n\n# ---- {ou['type'].upper()} {ou['name']} (lines {ou['start_line']}-{ou['end_line']}) [overlap] ----\n"
+                    current_parts.append(osep + ou["code"].rstrip())
+                    current_chars += len(osep) + len(ou["code"].rstrip())
+                    current_start = min(current_start, ou["start_line"])
+        current_parts.append(block_text)
+        current_chars += len(block_text)
+    if current_parts:
+        flush(units[-1]["end_line"])
+    return chunks
+
+
 def _chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> List[str]:
     if len(text) <= max_chars:
         return [text]
@@ -542,28 +649,34 @@ def index_repository(
         texts_to_embed, metadata_for_text = [], []
 
         # --- Embed Summary ---
-        from myapp.views import get_summary  # Local import to avoid circular dependency
+        try:
+            from myapp.views import (
+                get_summary,
+            )  # Local import to avoid circular dependency
 
-        summary_data = get_summary(repo_url)
-        if summary_data and summary_data.get("summary"):
-            print("Embedding repository summary...")
-            summary = summary_data["summary"]
-            for section_id, content in summary.items():
-                doc = f"Summary of Section: {section_id}\n\n{content}"
-                texts_to_embed.append(doc)
-                metadata_for_text.append(
-                    {
-                        "repo_url": repo_url,
-                        "commit": summary_data.get("commit"),
-                        "file_path": "repository-summary.md",
-                        "unit_name": f"Summary: {section_id}",
-                        "unit_type": "summary",
-                        "start_line": 1,
-                        "end_line": 1,
-                        "chunk_index": 0,
-                        "embedding_mode": mode,
-                    }
-                )
+            summary_data = get_summary(repo_url)
+            if summary_data and summary_data.get("summary"):
+                print("Embedding repository summary...")
+                summary = summary_data["summary"]
+                for section_id, content in summary.items():
+                    doc = f"Summary of Section: {section_id}\n\n{content}"
+                    texts_to_embed.append(doc)
+                    metadata_for_text.append(
+                        {
+                            "repo_url": repo_url,
+                            "commit": summary_data.get("commit"),
+                            "file_path": "repository-summary.md",
+                            "unit_name": f"Summary: {section_id}",
+                            "unit_type": "summary",
+                            "granularity": "summary",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "chunk_index": 0,
+                            "embedding_mode": mode,
+                        }
+                    )
+        except Exception as e:
+            print(f"Skipping summary embedding due to error: {e}")
 
         # Create a temporary file for logging what's being embedded
         log_file_path = tmpdir / "embedding_log.txt"
@@ -580,35 +693,64 @@ def index_repository(
                         log_f.write(f"SKIPPED: {fp.relative_to(tmpdir)}\n")
                         continue
 
-                    units = (
-                        _extract_python_units(fp)
-                        if fp.suffix == ".py"
-                        else [_fallback_file_unit(fp)]
-                    )
+                    is_python = fp.suffix == ".py"
+                    units = _extract_python_units(fp) if is_python else []
                     if not units:
-                        units = [_fallback_file_unit(fp)]
+                        # Non-Python or no units, treat whole file as single unit for unit-level fallback
+                        fu = _fallback_file_unit(fp)
+                        units = [fu]
+                    rel_path_str = str(fp.relative_to(tmpdir)).replace("\\", "/")
 
+                    # --- File-level chunks (granularity=file) ---
+                    file_chunks = _group_units_into_file_chunks(
+                        fp, units if is_python else []
+                    )
+                    for fch_text, fch_idx, fch_start, fch_end in file_chunks:
+                        doc = (
+                            f"File Chunk: {rel_path_str}\nChunk Index: {fch_idx}\nLines: {fch_start}-{fch_end}\n"  # header
+                            f"```\n{fch_text}\n```"
+                        )
+                        texts_to_embed.append(doc)
+                        metadata_for_text.append(
+                            {
+                                "repo_url": repo_url,
+                                "commit": commit,
+                                "file_path": rel_path_str,
+                                "unit_name": f"file_chunk_{fch_idx}",
+                                "unit_type": "file",
+                                "granularity": "file",
+                                "start_line": fch_start,
+                                "end_line": fch_end,
+                                "chunk_index": fch_idx,
+                                "embedding_mode": mode,
+                            }
+                        )
+                        log_f.write(f"--- FILE-LEVEL CHUNK ---\n{doc}\n\n")
+
+                    # --- Unit-level chunks (granularity=unit) ---
                     for u in units:
-                        chunks = _chunk_text(u["code"])
-                        for idx, ch in enumerate(chunks):
-                            doc = f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n```\n{ch}\n```"
+                        unit_chunks = _chunk_text(u["code"])
+                        for idx, ch in enumerate(unit_chunks):
+                            doc = (
+                                f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"  # header
+                                f"```\n{ch}\n```"
+                            )
                             texts_to_embed.append(doc)
                             metadata_for_text.append(
                                 {
                                     "repo_url": repo_url,
                                     "commit": commit,
-                                    "file_path": str(fp.relative_to(tmpdir)).replace(
-                                        "\\", "/"
-                                    ),
+                                    "file_path": rel_path_str,
                                     "unit_name": u["name"],
                                     "unit_type": u["type"],
+                                    "granularity": "unit",
                                     "start_line": u["start_line"],
                                     "end_line": u["end_line"],
                                     "chunk_index": idx,
                                     "embedding_mode": mode,
                                 }
                             )
-                            log_f.write(f"--- Document ---\n{doc}\n\n")
+                            log_f.write(f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
 
         if not texts_to_embed:
             statuses[repo_url] = {
@@ -635,10 +777,16 @@ def index_repository(
 
         embeddings = get_embeddings(texts_to_embed, "RETRIEVAL_DOCUMENT", mode)
 
-        ids = [
-            f"{m['repo_url']}:{m['file_path']}:{m['unit_name']}:{m['start_line']}:{m['chunk_index']}"
-            for m in metadata_for_text
-        ]
+        ids = []
+        for m in metadata_for_text:
+            base = f"{m['repo_url']}:{m['file_path']}:{m['unit_name']}:{m['start_line']}:{m['chunk_index']}"
+            if m.get("granularity") == "file":
+                base = "FILE::" + base
+            elif m.get("granularity") == "unit":
+                base = "UNIT::" + base
+            else:
+                base = "OTHER::" + base
+            ids.append(base)
 
         collection.add(
             ids=ids,
@@ -733,4 +881,288 @@ def get_embedding_info() -> Dict:
         "deny_filenames": sorted(list(DENY_FILENAMES)),
         "deny_dir_names": sorted(list(DENY_DIR_NAMES)),
         "max_file_size_bytes": MAX_FILE_SIZE_BYTES,
+        "dual_indexing": {
+            "file_level_max_chars": FILE_LEVEL_MAX_CHARS,
+            "file_level_window_target": FILE_LEVEL_WINDOW_TARGET,
+            "file_level_overlap_functions": FILE_LEVEL_OVERLAP_FUNCTIONS,
+        },
+        "retrieval": {
+            "high_level_top_k_files": HIGH_LEVEL_TOP_K_FILES,
+            "high_level_unit_per_file": HIGH_LEVEL_UNIT_PER_FILE,
+        },
+        "classifier_model": CLASSIFIER_MODEL_NAME,
     }
+
+
+# =============================
+# Advanced Retrieval Pipeline
+# =============================
+
+LOW_LEVEL_LABEL = "low_level"
+HIGH_LEVEL_LABEL = "high_level"
+
+_classification_lock = threading.Lock()
+
+
+def classify_question(question: str) -> str:
+    """Classify a user question as low-level or high-level using semantic similarity to prototype phrases.
+
+    Falls back to heuristic keywords if model unavailable.
+    """
+    prototypes = {
+        LOW_LEVEL_LABEL: [
+            "how is implemented",
+            "implementation detail",
+            "function",
+            "class",
+            "parameter",
+            "algorithm",
+            "internal logic",
+            "source code of",
+            "definition of",
+        ],
+        HIGH_LEVEL_LABEL: [
+            "architecture",
+            "overall design",
+            "data flow",
+            "component interaction",
+            "module overview",
+            "high level",
+            "system overview",
+            "lifecycle",
+            "process flow",
+        ],
+    }
+    try:
+        model = _load_classifier_model()
+        with _classification_lock:
+            q_emb = model.encode([question], normalize_embeddings=True)[0]
+            scores = {}
+            import numpy as np
+
+            for label, phrases in prototypes.items():
+                emb = model.encode(phrases, normalize_embeddings=True)
+                cat_vec = emb.mean(axis=0)
+                scores[label] = float(
+                    np.dot(q_emb, cat_vec) / (np.linalg.norm(cat_vec) + 1e-8)
+                )
+            # Decide winner
+            winner = max(scores.items(), key=lambda kv: kv[1])[0]
+            # Light threshold: if difference small and question contains architecture keywords => high-level
+            diff = abs(scores[HIGH_LEVEL_LABEL] - scores[LOW_LEVEL_LABEL])
+            if diff < 0.03 and any(
+                k in question.lower()
+                for k in ["architecture", "overview", "data flow", "flow", "design"]
+            ):
+                winner = HIGH_LEVEL_LABEL
+            return winner
+    except Exception as e:
+        print(f"Classifier fallback due to error: {e}")
+        ql = question.lower()
+        if any(
+            k in ql
+            for k in [
+                "architecture",
+                "overview",
+                "data flow",
+                "flow",
+                "design",
+                "interaction",
+                "components",
+            ]
+        ):
+            return HIGH_LEVEL_LABEL
+        return LOW_LEVEL_LABEL
+
+
+def _query_chroma_raw(
+    collection, query_embedding, where: Dict, top_k: int
+) -> List[Dict]:
+    """Internal helper to query Chroma with support for multi-key equality filters.
+
+    Some Chroma versions require a single operator in `where`. When multiple
+    equality constraints are needed we synthesize an $and list.
+    """
+
+    def _normalize_where(w: Dict) -> Dict:
+        if not w:
+            return {}
+        if len(w) == 1:
+            return w
+        # Convert to $and list of simple equality objects
+        return {"$and": [{k: v} for k, v in w.items()]}
+
+    where_clause = _normalize_where(where)
+    try:
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            where=where_clause,
+        )
+        if not results or not results.get("documents"):
+            return []
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        return [
+            {"document": d, "metadata": m}
+            for d, m in zip(docs, metas)
+            if m.get("granularity") != "summary"  # exclude summaries for now
+        ]
+    except Exception as e:
+        print(f"Raw query error: {e}")
+        return []
+
+
+def query_repository_advanced(
+    question: str,
+    repo_url: str,
+    persist_dir: str = "chroma_persist",
+    collection_name: str = "repo_functions",
+    embedding_mode: Optional[str] = None,
+    top_k_units: int = 25,
+) -> Dict:
+    """Advanced retrieval implementing classification + dual-stage retrieval.
+
+    Returns dict with keys: classification, documents (list like query_repository), debug(optional)
+    """
+    classification = classify_question(question)
+    mode = embedding_mode or EMBEDDING_MODE
+    try:
+        import chromadb  # local import
+
+        client = chromadb.PersistentClient(path=persist_dir)
+        collection = client.get_collection(collection_name)
+    except Exception as e:
+        print(f"Could not open collection for advanced query: {e}")
+        return {"classification": classification, "documents": []}
+
+    # Embed query once
+    try:
+        query_embedding = get_embeddings([question], "RETRIEVAL_QUERY", mode)[0]
+    except Exception as e:
+        print(f"Failed embedding query in advanced retrieval: {e}")
+        return {"classification": classification, "documents": []}
+
+    debug = {"classification": classification}
+
+    if classification == LOW_LEVEL_LABEL:
+        # Direct unit-level retrieval
+        unit_docs = _query_chroma_raw(
+            collection,
+            query_embedding,
+            {"repo_url": repo_url, "granularity": "unit"},
+            top_k_units,
+        )
+        grouped = _group_unit_docs(unit_docs)
+        return {"classification": classification, "documents": grouped, "debug": debug}
+
+    # High-level: 2 stage
+    file_docs = _query_chroma_raw(
+        collection,
+        query_embedding,
+        {"repo_url": repo_url, "granularity": "file"},
+        HIGH_LEVEL_TOP_K_FILES,
+    )
+    if not file_docs:
+        # fallback to low-level
+        unit_docs = _query_chroma_raw(
+            collection,
+            query_embedding,
+            {"repo_url": repo_url, "granularity": "unit"},
+            top_k_units,
+        )
+        grouped = _group_unit_docs(unit_docs)
+        return {"classification": classification, "documents": grouped, "debug": debug}
+
+    selected_files = [d["metadata"]["file_path"] for d in file_docs]
+    debug["selected_files"] = selected_files
+
+    # Retrieve unit-level inside each selected file
+    per_file_units: List[Dict] = []
+    for fp in selected_files:
+        # smaller per-file query to get most relevant units from that file
+        units_for_file = _query_chroma_raw(
+            collection,
+            query_embedding,
+            {"repo_url": repo_url, "granularity": "unit", "file_path": fp},
+            HIGH_LEVEL_UNIT_PER_FILE,
+        )
+        per_file_units.extend(units_for_file)
+
+    grouped = _group_unit_docs(per_file_units, file_docs)
+    return {"classification": classification, "documents": grouped, "debug": debug}
+
+
+def _group_unit_docs(
+    unit_docs: List[Dict], file_docs: Optional[List[Dict]] = None
+) -> List[Dict]:
+    """Group multiple unit-level docs under their file path and merge content.
+
+    If file_docs provided (from high-level stage1) we prepend the first file-level chunk for broader context.
+    """
+    # Map file_path -> list of units
+    files: Dict[str, Dict] = {}
+    # Index first file-level doc for each file
+    file_level_map = {}
+    if file_docs:
+        for fd in file_docs:
+            fp = fd["metadata"].get("file_path")
+            if fp not in file_level_map:
+                file_level_map[fp] = fd
+
+    for doc in unit_docs:
+        meta = doc["metadata"]
+        fp = meta.get("file_path")
+        if fp not in files:
+            files[fp] = {"units": [], "file_meta": meta}
+        files[fp]["units"].append(doc)
+
+    merged_docs: List[Dict] = []
+    total_chars = 0
+    for fp, bundle in files.items():
+        # Sort units by start_line
+        units_sorted = sorted(
+            bundle["units"], key=lambda d: d["metadata"].get("start_line", 0)
+        )
+        # Build content
+        content_parts = []
+        if fp in file_level_map:
+            content_parts.append(
+                f"# FILE CONTEXT: {fp}\n" + file_level_map[fp]["document"] + "\n\n"
+            )
+        content_parts.append(f"# SELECTED FUNCTIONS / CLASSES FROM {fp}\n")
+        min_line = None
+        max_line = None
+        for ud in units_sorted:
+            m = ud["metadata"]
+            min_line = (
+                m.get("start_line")
+                if min_line is None
+                else min(min_line, m.get("start_line"))
+            )
+            max_line = (
+                m.get("end_line")
+                if max_line is None
+                else max(max_line, m.get("end_line"))
+            )
+            content_parts.append(ud["document"])
+        merged_text = "\n\n".join(content_parts)
+        if total_chars + len(merged_text) > MAX_TOTAL_GROUPED_CONTEXT_CHARS:
+            break
+        total_chars += len(merged_text)
+        merged_docs.append(
+            {
+                "document": merged_text,
+                "metadata": {
+                    "file_path": fp,
+                    "start_line": min_line or 1,
+                    "end_line": max_line or 1,
+                    "unit_type": "grouped",
+                    "granularity": "group",
+                },
+            }
+        )
+    # Fallback: if grouping produced nothing due to size limit, return raw units
+    if not merged_docs:
+        return unit_docs
+    return merged_docs
