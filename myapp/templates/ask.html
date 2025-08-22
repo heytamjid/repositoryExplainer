@@ -86,6 +86,42 @@
         #indexRepoBtn {
             background-color: #00e676; /* Bright green */
         }
+        /* Markdown / code styling */
+        .messages pre {
+            background: #1e1e1e;
+            color: #e6e6e6;
+            padding: 14px 16px;
+            border: 2px solid #000;
+            box-shadow: 4px 4px 0 #000;
+            overflow-x: auto;
+            border-radius: 0;
+            line-height: 1.4;
+            margin: 12px 0;
+            max-width: 100%;
+            font-size: 13px;
+        }
+        .messages code:not(pre code) {
+            background: #fff3b0;
+            padding: 2px 5px;
+            border: 1px solid #000;
+            font-size: 90%;
+        }
+        .messages pre code {
+            background: transparent;
+            padding: 0;
+            font-family: "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+        }
+        .messages h1, .messages h2, .messages h3, .messages h4 {
+            margin-top: 1.6em;
+            border-bottom: 1px solid #000;
+            padding-bottom: 4px;
+        }
+        .messages table { border-collapse: collapse; }
+        .messages table, .messages th, .messages td { border:1px solid #000; }
+        .messages th, .messages td { padding:4px 8px; }
+        .messages blockquote { border-left:4px solid #000; margin:8px 0; padding:4px 12px; background:#fafafa; }
+        /* File / lookup headers produced by backend */
+        .messages .lookup-header { background:#ffe9a8; padding:4px 8px; border:1px solid #000; font-weight:600; display:block; margin-top:14px; }
     </style>
 </head>
 <body>
@@ -108,7 +144,16 @@
         </div>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" integrity="sha512-dummy" crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha512-dummy" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script>
+        marked.setOptions({
+            gfm: true,
+            breaks: true,
+            highlight: function(code, lang){
+                try { return hljs.highlight(code, {language: lang}).value; } catch(e) { return hljs.highlightAuto(code).value; }
+            }
+        });
         const sendBtn = document.getElementById('sendBtn');
         const indexRepoBtn = document.getElementById('indexRepoBtn');
         const userInput = document.getElementById('userInput');
@@ -186,6 +231,10 @@
                 const data = await resp.json();
                 messages.removeChild(thinkingMessage);
                 appendMessage(marked.parse(data.answer || 'No response'), 'assistant');
+                // Post-processing: mark lookup/FILE headings inside paragraphs as styled blocks
+                [...messages.querySelectorAll('.assistant')].slice(-1).forEach(block => {
+                    block.innerHTML = block.innerHTML.replace(/=== (LOOKUP [^=]+) ===/g, '<span class="lookup-header">$1</span>');
+                });
             } catch (e) {
                 console.error('Error:', e);
                 messages.removeChild(thinkingMessage);

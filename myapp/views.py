@@ -803,9 +803,10 @@ def api_ask(request):
                     print(f"[AGENT] TRACE {line}")
             answer += "\n" + "\n".join(trace_lines)
 
+        # Return raw markdown so the frontend (Marked.js) can render consistently without double conversion
         return JsonResponse(
             {
-                "answer": markdown2.markdown(answer),
+                "answer": answer,
                 "status": "success",
                 "embedding_mode": repo_status_data.get("embedding_mode", "unknown"),
                 "num_results": len(retrieved_docs),
