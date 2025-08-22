@@ -43,13 +43,13 @@ SECTION_DEFINITIONS = [
     },
     {
         "id": "core_components",
-        "title": "Core Components (Implementation Details)",
-        "description": "Primary source code modules and packages implementing the main features.",
+        "title": "Core Components & Business Logic",
+        "description": "Primary source code modules and packages implementing the core features and business logics.",
     },
     {
         "id": "data_model",
-        "title": "Data Model",
-        "description": "ORM models, schemas, and database interaction layers.",
+        "title": "Data Flow",
+        "description": "Data flow across the system, database schemas and database interaction layers.",
     },
 ]
 
@@ -155,8 +155,7 @@ def get_important_files_by_category(repo_tree, sections=SECTION_DEFINITIONS):
         for s in sections
     ]
     prompt_template_files = """
-You are an expert software architect. Given a repository file list, return a JSON object that maps
-section IDs to an array of the most relevant file paths for that section.
+You are an expert software architect. Given a repository file list, return a JSON object that maps section IDs to an array of the most relevant file paths for that section. "Most relevant" files are those that directly implement or strongly support the section’s described functionality or intention.
 Important rules:
 - Output MUST be valid JSON and only the JSON object (no surrounding explanation).
 - Keys must be the section ids provided in the `sections` input.

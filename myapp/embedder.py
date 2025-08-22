@@ -1070,16 +1070,30 @@ def index_repository(
 
         embeddings = get_embeddings(texts_to_embed, "RETRIEVAL_DOCUMENT", mode)
 
+        # Build stable but unique IDs for every vector. Previous scheme omitted end_line
+        # and could collide for overlapping or duplicated units (e.g., JSON chunks) which
+        # caused Chroma to reject the batch with a duplicate ID error. We now:
+        # 1. Include end_line in the base identifier.
+        # 2. Add a numeric suffix if a collision still occurs (defensive uniqueness layer).
         ids = []
+        seen_counts: Dict[str, int] = {}
         for m in metadata_for_text:
-            base = f"{m['repo_url']}:{m['file_path']}:{m['unit_name']}:{m['start_line']}:{m['chunk_index']}"
+            base_core = f"{m['repo_url']}:{m['file_path']}:{m['unit_name']}:{m['start_line']}:{m.get('end_line')}:{m['chunk_index']}"
             if m.get("granularity") == "file":
-                base = "FILE::" + base
+                base = "FILE::" + base_core
             elif m.get("granularity") == "unit":
-                base = "UNIT::" + base
+                base = "UNIT::" + base_core
+            elif m.get("granularity") == "summary":
+                base = "SUMMARY::" + base_core
             else:
-                base = "OTHER::" + base
-            ids.append(base)
+                base = "OTHER::" + base_core
+            if base in seen_counts:
+                seen_counts[base] += 1
+                unique_id = f"{base}__{seen_counts[base]}"
+                ids.append(unique_id)
+            else:
+                seen_counts[base] = 0
+                ids.append(base)
 
         collection.add(
             ids=ids,
@@ -1108,6 +1122,15 @@ def index_repository(
 
     except Exception as e:
         print(f"An unexpected error occurred during indexing: {e}")
+        # Best-effort cleanup: remove any partially added vectors for this repo so that
+        # the next indexing attempt truly starts fresh (user requirement).
+        try:
+            client = chromadb.PersistentClient(path=persist_dir)
+            collection = client.get_or_create_collection(collection_name)
+            collection.delete(where={"repo_url": repo_url})
+            print("Partial embeddings cleaned up after failure.")
+        except Exception as cleanup_err:
+            print(f"Cleanup after failure encountered an error: {cleanup_err}")
         statuses[repo_url] = {"status": "failed", "error": str(e)}
         _write_status(status_path, statuses)
         return {"status": "error", "message": str(e)}
