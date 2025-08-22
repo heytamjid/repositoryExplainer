@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover - optional dependency errors handled later
 
 # --- Configuration ---
 # Embedding Configuration (unit-level and file-level)
-EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "local")  # "local" or "remote"
+EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "remote")  # "local" or "remote"
 LOCAL_EMBEDDING_MODEL = (
     "nomic-ai/nomic-embed-text-v1.5"  # Nomic model for local embedding
 )

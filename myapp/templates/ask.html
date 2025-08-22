@@ -4,25 +4,97 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ask Question - Repository Explainer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width:900px; margin:20px auto; padding:0 16px; }
-        .chat-container { border:1px solid #eaecef; border-radius:8px; padding:16px; background:#fff; }
-        .messages { height:400px; overflow:auto; border:1px solid #f0f0f0; padding:12px; border-radius:6px; background:#fafafa; }
-        .message { margin-bottom:12px; }
-        .user { color:#0b5ed7; }
-        .assistant { color:#111; }
-        .input-row { display:flex; gap:8px; margin-top:12px; }
-        input[type="text"] { flex:1; padding:10px; border:1px solid #ccc; border-radius:6px; }
-        button { padding:10px 14px; border-radius:6px; border:none; background:#007bff; color:#fff; cursor:pointer; }
+        body { 
+            font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            max-width: 900px; 
+            margin: 20px auto; 
+            padding: 0 16px; 
+            background-color: #f0f0f0;
+            color: #000;
+        }
+        h1 {
+            font-weight: 700;
+            border-bottom: 3px solid #000;
+            padding-bottom: 10px;
+        }
+        .chat-container { 
+            border: 2px solid #000; 
+            padding: 16px; 
+            background: #fff; 
+            box-shadow: 8px 8px 0 #000;
+        }
+        .messages { 
+            height: 400px; 
+            overflow: auto; 
+            border: 2px solid #000; 
+            padding: 12px; 
+            background: #fafafa; 
+            margin-bottom: 16px;
+        }
+        .message { 
+            margin-bottom: 12px; 
+        }
+        .user { 
+            font-weight: bold;
+            color: #000; 
+        }
+        .assistant { 
+            color: #111; 
+        }
+        .input-row, .repo-row { 
+            display: flex; 
+            gap: 10px; 
+            margin-bottom: 12px;
+            align-items: center;
+        }
+        input[type="text"] { 
+            flex: 1; 
+            padding: 10px; 
+            border: 2px solid #000; 
+            border-radius: 0;
+            background: #fff;
+            box-shadow: 4px 4px 0 #000;
+            transition: box-shadow 0.2s ease-in-out;
+        }
+        input[type="text"]:focus {
+            outline: none;
+            box-shadow: 2px 2px 0 #000;
+        }
+        button { 
+            padding: 10px 14px; 
+            border-radius: 0; 
+            border: 2px solid #000; 
+            background: #ffdd00; 
+            color: #000; 
+            cursor: pointer; 
+            font-weight: bold;
+            box-shadow: 4px 4px 0 #000;
+            transition: all 0.2s ease-in-out;
+        }
+        button:hover {
+            box-shadow: 2px 2px 0 #000;
+            transform: translate(2px, 2px);
+        }
+        button:active {
+            box-shadow: 0 0 0 #000;
+            transform: translate(4px, 4px);
+        }
+        #indexRepoBtn {
+            background-color: #00e676; /* Bright green */
+        }
     </style>
 </head>
 <body>
     <h1>Ask Questions about the Repository</h1>
     <p>First, click the "Index Repository" button to make the codebase searchable. Then, you can ask natural-language questions.</p>
-    <div style="margin-bottom:10px;">
-        <label for="repoUrl">Repository:</label>
-        <input id="repoUrl" type="text" style="width:70%; padding:6px; margin-left:8px;" placeholder="Repository URL will be pre-filled if provided" />
-        <button id="indexRepoBtn" style="margin-left: 8px;">Index Repository</button>
+    <div class="repo-row" style="margin-bottom:20px;">
+        <label for="repoUrl" style="font-weight: bold;">Repository:</label>
+        <input id="repoUrl" type="text" placeholder="Enter a GitHub URL to begin" />
+        <button id="indexRepoBtn">Index Repository</button>
     </div>
 
     <div class="chat-container">
@@ -46,7 +118,16 @@
         function appendMessage(html, cls) {
             const d = document.createElement('div');
             d.className = 'message ' + cls;
-            d.innerHTML = html; // Use innerHTML to render markdown
+            
+            if (cls === 'user') {
+                const strong = document.createElement('strong');
+                strong.innerText = "You: ";
+                d.appendChild(strong);
+                d.append(html);
+            } else {
+                d.innerHTML = html; // Use innerHTML to render markdown from assistant
+            }
+            
             messages.appendChild(d);
             messages.scrollTop = messages.scrollHeight;
         }
@@ -83,7 +164,12 @@
             appendMessage(q, 'user');
             userInput.value = '';
 
-            appendMessage('Thinking...', 'assistant');
+            const thinkingMessage = document.createElement('div');
+            thinkingMessage.className = 'message assistant';
+            thinkingMessage.innerText = 'Thinking...';
+            messages.appendChild(thinkingMessage);
+            messages.scrollTop = messages.scrollHeight;
+
             try {
                 const repoVal = repoUrlField.value.trim();
                 
@@ -98,14 +184,18 @@
                 }
                 
                 const data = await resp.json();
-                const last = messages.querySelectorAll('.message.assistant');
-                if (last.length) last[last.length-1].remove();
+                messages.removeChild(thinkingMessage);
                 appendMessage(marked.parse(data.answer || 'No response'), 'assistant');
             } catch (e) {
                 console.error('Error:', e);
-                const last = messages.querySelectorAll('.message.assistant');
-                if (last.length) last[last.length-1].remove();
+                messages.removeChild(thinkingMessage);
                 appendMessage('Failed to contact server: ' + e.message, 'assistant');
+            }
+        });
+        
+        userInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                sendBtn.click();
             }
         });
 
