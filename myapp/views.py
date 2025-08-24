@@ -423,7 +423,7 @@ def api_ask(request):
     except json.JSONDecodeError:
         return HttpResponseBadRequest("Invalid JSON")
 
-    if not repo_url and action != "get_config":
+    if not repo_url and action not in ("get_config", "status"):
         return JsonResponse({"answer": "A repository URL is required."})
 
     # Handle configuration requests
@@ -432,6 +432,20 @@ def api_ask(request):
             {
                 "embedding_info": embedder.get_embedding_info(),
                 "status": "config_retrieved",
+            }
+        )
+
+    # Polling for indexing status only
+    if action == "status":
+        repo_status_data = embedder.get_indexing_status(
+            repo_url, persist_dir=CHROMA_PERSIST_DIR
+        )
+        return JsonResponse(
+            {
+                "status": repo_status_data.get("status", "not_indexed"),
+                "embedding_mode": repo_status_data.get(
+                    "embedding_mode", embedder.EMBEDDING_MODE
+                ),
             }
         )
 

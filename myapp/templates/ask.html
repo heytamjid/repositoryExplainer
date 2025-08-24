@@ -126,11 +126,19 @@
 </head>
 <body>
     <h1>Ask Questions about the Repository</h1>
-    <p>First, click the "Index Repository" button to make the codebase searchable. Then, you can ask natural-language questions.</p>
+    <p>First, click the "Index Repository" button to make the codebase searchable (might take 2-5 minutes). Then, you can ask natural-language questions once it is done.</p>
     <div class="repo-row" style="margin-bottom:20px;">
         <label for="repoUrl" style="font-weight: bold;">Repository:</label>
         <input id="repoUrl" type="text" placeholder="Enter a GitHub URL to begin" />
         <button id="indexRepoBtn">Index Repository</button>
+    </div>
+
+    <div id="indexProgress" style="display:none; border:2px solid #000; padding:10px; background:#fff; box-shadow:4px 4px 0 #000; margin-bottom:20px;">
+        <strong>Indexing Progress</strong>
+        <div id="indexSteps" style="margin-top:8px; font-size:14px; line-height:1.4;"></div>
+        <div style="margin-top:10px; background:#ddd; height:14px; position:relative;">
+            <div id="indexBar" style="background:#00e676; height:100%; width:0%; transition:width .6s;"></div>
+        </div>
     </div>
 
     <div class="chat-container">
@@ -159,6 +167,57 @@
         const userInput = document.getElementById('userInput');
         const messages = document.getElementById('messages');
         const repoUrlField = document.getElementById('repoUrl');
+        const indexProgress = document.getElementById('indexProgress');
+        const indexStepsDiv = document.getElementById('indexSteps');
+        const indexBar = document.getElementById('indexBar');
+
+        // Simulated step lists (purely cosmetic)
+        const INDEXING_STEPS = [
+            'Cloning repository',
+            'Scanning files',
+            'Parsing code units',
+            'Generating embeddings',
+            'Persisting to vector store',
+            'Building repository map',
+            'It should not take more than 2-5 minutes depending on codebase size... Just know that we are working on it at our limit on the backend.'
+        ];
+
+        function simulateProgress(stepList, barEl, stepsEl, totalDurationMs=9000) {
+            stepsEl.innerHTML = '';
+            barEl.style.width = '0%';
+            let done = 0;
+            const per = 100 / stepList.length;
+            indexProgress.style.display = 'block';
+            function advance(){
+                if (done >= stepList.length) return;            
+                const step = stepList[done];
+                const line = document.createElement('div');
+                line.textContent = '✔ ' + step;
+                stepsEl.appendChild(line);
+                done++;
+                barEl.style.width = Math.min(done * per, 100) + '%';
+                if (done < stepList.length){
+                    setTimeout(advance, totalDurationMs / stepList.length);
+                }
+            }
+            setTimeout(advance, 250);
+        }
+
+        async function pollIndexStatus(repo){
+            try {
+                const r = await fetch('/api/ask/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'status', repo_url:repo})});
+                if(!r.ok) return;
+                const js = await r.json();
+                if (js.status === 'done') {
+                    const line = document.createElement('div');
+                    line.innerHTML = '<strong>Index complete. You can ask questions now...</strong>';
+                    indexStepsDiv.appendChild(line);
+                    indexBar.style.width = '100%';
+                } else if (js.status === 'running') {
+                    setTimeout(()=>pollIndexStatus(repo), 2000);
+                }
+            } catch(e){ console.warn('Poll error', e); }
+        }
 
         function appendMessage(html, cls) {
             const d = document.createElement('div');
@@ -184,6 +243,7 @@
                 return;
             }
             appendMessage(`Starting to index ${repoVal}... This may take a few minutes.`, 'assistant');
+        simulateProgress(INDEXING_STEPS, indexBar, indexStepsDiv);
             try {
                 const resp = await fetch('/api/ask/', {
                     method: 'POST',
@@ -194,6 +254,7 @@
                 const data = await resp.json();
                 if (data.status === 'indexing_started') {
                     appendMessage('Indexing process has begun on the server. You can start asking questions once it is complete.', 'assistant');
+            pollIndexStatus(repoVal);
                 } else {
                     appendMessage('Could not start indexing. Please check the server logs.', 'assistant');
                 }
@@ -211,9 +272,21 @@
 
             const thinkingMessage = document.createElement('div');
             thinkingMessage.className = 'message assistant';
-            thinkingMessage.innerText = 'Thinking...';
+            thinkingMessage.innerText = 'Answering (planning retrieval steps)...';
             messages.appendChild(thinkingMessage);
             messages.scrollTop = messages.scrollHeight;
+
+            // Cosmetic QA progress (deterministic timing)
+            const qaPhases = ['Classifying question', 'Retrieving candidate chunks', 'Merging context', 'Consulting summary & map', 'It should not take more than 1-2 minutes. Just know that we are working on it at our limit on the backend.'];
+            let qaIdx = 0;
+            const qaTimer = setInterval(()=>{
+                if (qaIdx < qaPhases.length){
+                    thinkingMessage.innerText = 'Answering: ' + qaPhases[qaIdx];
+                    qaIdx++;
+                } else {
+                    clearInterval(qaTimer);
+                }
+            }, 900);
 
             try {
                 const repoVal = repoUrlField.value.trim();
@@ -230,6 +303,7 @@
                 
                 const data = await resp.json();
                 messages.removeChild(thinkingMessage);
+                clearInterval(qaTimer);
                 appendMessage(marked.parse(data.answer || 'No response'), 'assistant');
                 // Post-processing: mark lookup/FILE headings inside paragraphs as styled blocks
                 [...messages.querySelectorAll('.assistant')].slice(-1).forEach(block => {
