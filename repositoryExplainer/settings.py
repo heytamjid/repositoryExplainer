@@ -135,10 +135,11 @@ LOGGING = {
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
+            "stream": sys.stdout,
         },
     },
     "root": {
         "handlers": ["console"],
-        "level": "DEBUG",
+        "level": "DEBUG",  # or INFO in production
     },
 }
