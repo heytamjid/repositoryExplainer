@@ -1,54 +1,59 @@
-import os
-import requests
-import base64
-import re
-import json
-import time
-import threading
-from urllib.parse import (
-    urlparse,
-)  # (kept if other code still references, will be removable later)
+"""Django view layer for the Repository Explainer application.
 
-from django.shortcuts import render
-from django.http import JsonResponse, HttpResponseBadRequest
-from django.views.decorators.csrf import csrf_exempt
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-import markdown2  # (may be removable after full migration)
+This module exposes:
+    - Web views (home, ask_question) for rendering HTML templates.
+    - JSON API endpoints (api_ask, api_embedding_config) for:
+            * Repository indexing lifecycle (start, status, clear)
+            * Question answering over a codebase using vector search + LLM
+            * Embedding configuration (local vs remote modes, diagnostics)
+    - Integration glue between GitHub utilities, summarization, embedding, and QA modules.
 
-from . import embedder  # retains backward compatibility
-from .agent import (
-    run_agentic_lookups,
-)  # kept for backward compatibility (qa_module uses it)
-from .github_utils import (
-    parse_github_url,
-    fetch_repo_tree,
-    get_file_content,
-)
+The goal is to keep business / retrieval / summarization logic in their own modules
+(`embedder`, `summar`, `qa_module`, etc.) and let this file focus on HTTP orchestration
+and response shaping. Comments are added inline to clarify intent of each block.
+"""
+
+import os  # Environment variable access for API keys & runtime config
+import json  # JSON request/response handling
+import threading  # For background indexing without blocking HTTP request
+
+from django.shortcuts import render  # Template rendering
+from django.http import JsonResponse, HttpResponseBadRequest  # HTTP responses
+from django.views.decorators.csrf import (
+    csrf_exempt,
+)  # Allow API POSTs without CSRF token
+
+
+from . import embedder  # Embedding & indexing orchestration module
 from .summar import (
     SECTION_DEFINITIONS,
-    get_summary,
     generate_or_get_summary,
 )
+
+# Core QA pipeline (retrieval + LLM synthesis)
 from .qa_module import answer_question
 
-# Optional direct imports (not strictly necessary, but clarify modularization)
-from . import retrieval  # noqa: F401
-from . import repo_map as repo_map_utils  # avoid shadowing later variables
 
-# --- Configuration & Constants ---
+#############################################
+# Configuration & Constants
+#############################################
+# External service credentials (must be set in environment for full functionality)
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-LLM_MODEL_NAME = "gemini-2.5-flash"
+# LLM configuration (values primarily used in other modules, kept here for clarity)
+LLM_MODEL_NAME = "gemini-2.5-flash"  # Default conversational / reasoning model
+# Low randomness for deterministic identification tasks
 LLM_TEMPERATURE_IDENTIFY = 0.1
-LLM_TEMPERATURE_GENERATE = 0.4
-MAX_TOTAL_CONTEXT_CHARS = 50000
+LLM_TEMPERATURE_GENERATE = 0.4  # Slightly higher for answer synthesis
+MAX_TOTAL_CONTEXT_CHARS = 100000  # Soft limit to prevent runaway prompt sizes
 
-CHROMA_PERSIST_DIR = "chroma_persist"
-CHROMA_COLLECTION_NAME = "repo_functions"
-SUMMARY_CACHE_FILE = "summaries.json"
+# Vector / persistence layer configuration
+CHROMA_PERSIST_DIR = "chroma_persist"  # On-disk location for Chroma DB
+CHROMA_COLLECTION_NAME = (
+    "repo_functions"  # Logical collection name per repository code units
+)
+SUMMARY_CACHE_FILE = "summaries.json"  # JSON cache for generated repo summaries
 
 # SECTION_DEFINITIONS now imported from summar module
 
@@ -61,37 +66,55 @@ SUMMARY_CACHE_FILE = "summaries.json"
 
 
 # --- LLM Interaction Functions (No changes here) ---
-## get_important_files_by_category now provided by summar module
+# get_important_files_by_category now provided by summar module
 
 
-## generate_documentation now provided by summar module
+# generate_documentation now provided by summar module
 
 
 # --- Django Views ---
 
 
 def home(request):
+    """Render landing page for repository summarization.
+
+    GET: Display empty form and (optionally) current embedding engine info.
+    POST: Accept a GitHub repository URL, trigger summary generation (or fetch from cache)
+          and return structured documentation sections for display.
+
+    The heavy lifting (tree fetch, summarization, caching) is delegated to
+    `generate_or_get_summary` in the `summar` module, keeping view thin.
+    """
+    # Initialize default template context
     documentation = None
     error = None
     repo_url = ""
-    cached_commit = None
-    is_cached = False
-    embedding_info = embedder.get_embedding_info()
+    cached_commit = None  # Commit SHA associated with cached summary (if any)
+    is_cached = False  # Indicates whether summary was served from cache
+    embedding_info = (
+        embedder.get_embedding_info()
+    )  # Surface current embedding mode/status
 
-    if request.method == "POST":
+    if request.method == "POST":  # Form submission for new repository summarization
         repo_url = request.POST.get("repo_url")
         force_resummarize = request.POST.get("force_resummarize") == "true"
 
         if repo_url:
             if not GITHUB_TOKEN or not GOOGLE_API_KEY:
+                # Fail early if runtime configuration incomplete
                 error = "Server configuration error: API keys are missing."
             else:
+                # Retrieve existing summary or compute new one (force flag overrides cache)
                 documentation, cached_commit, is_cached = generate_or_get_summary(
                     repo_url, force=force_resummarize
                 )
                 if documentation is None:
-                    error = "Could not fetch the repository file structure. Please check the URL."
+                    # Upstream failure: invalid URL or network/API issue
+                    error = (
+                        "Could not fetch/generate the summary. Please check the URL."
+                    )
 
+    # Render HTML with full context (sections definitions drive dynamic template grouping)
     return render(
         request,
         "home.html",
@@ -108,9 +131,19 @@ def home(request):
 
 
 def ask_question(request):
-    # ... (code is unchanged)
-    repo_url = request.GET.get("repo_url", "")
-    embedding_info = embedder.get_embedding_info()
+    """Render the question-answering interface.
+
+    This view does not perform retrieval/LLM work directly— it just
+    passes along any pre-selected repo URL (query param) and embedding
+    system metadata so the front-end can display status and send AJAX
+    requests to `api_ask`.
+    """
+    repo_url = request.GET.get(
+        "repo_url", ""
+    )  # Prefill if user arrived from summary page
+    embedding_info = (
+        embedder.get_embedding_info()
+    )  # Expose current embedding mode/settings
     return render(
         request,
         "ask.html",
@@ -123,22 +156,37 @@ def ask_question(request):
 
 @csrf_exempt
 def api_ask(request):
+    """Unified API endpoint for config retrieval, indexing control, and QA.
+
+    Accepts JSON POST with fields:
+      - action: one of
+          * 'ask' (default) – answer a question over the repo
+          * 'start_indexing' – begin background embedding & vector store build
+          * 'status' – poll current indexing state
+          * 'get_config' – fetch embedding configuration/metadata
+      - repo_url: GitHub repository URL (required except for 'get_config'/'status')
+      - question: Natural language query (required for 'ask')
+      - embedding_mode: Optional override (e.g., 'local' or 'remote')
+    """
     if request.method != "POST":
         return HttpResponseBadRequest("POST required")
 
+    # --- Parse & validate inbound JSON payload ---
     try:
         body = json.loads(request.body.decode("utf-8"))
         question = body.get("question", "").strip()
         repo_url = body.get("repo_url", "").strip()
-        action = body.get("action", "ask")  # 'ask', 'start_indexing', or 'get_config'
-        embedding_mode = body.get("embedding_mode")  # Optional embedding mode override
+        action = body.get("action", "ask")  # Fallback to standard QA workflow
+        # Optional override per request
+        embedding_mode = body.get("embedding_mode")
     except json.JSONDecodeError:
         return HttpResponseBadRequest("Invalid JSON")
 
     if not repo_url and action not in ("get_config", "status"):
+        # 'ask' and 'start_indexing' require a repository context
         return JsonResponse({"answer": "A repository URL is required."})
 
-    # Handle configuration requests
+    # --- Configuration discovery (front-end bootstrap) ---
     if action == "get_config":
         return JsonResponse(
             {
@@ -147,7 +195,7 @@ def api_ask(request):
             }
         )
 
-    # Polling for indexing status only
+    # --- Poll for existing indexing lifecycle status ---
     if action == "status":
         repo_status_data = embedder.get_indexing_status(
             repo_url, persist_dir=CHROMA_PERSIST_DIR
@@ -161,13 +209,13 @@ def api_ask(request):
             }
         )
 
-    # Handle indexing requests
+    # --- Kick off asynchronous repository indexing ---
     if action == "start_indexing":
         print(f"Received request to start indexing for {repo_url}")
         if embedding_mode:
             print(f"Using embedding mode: {embedding_mode}")
 
-        def _start_index_task():
+        def _start_index_task():  # Background worker closure
             print(f"Starting indexing thread for {repo_url}")
             try:
                 res = embedder.index_repository(
@@ -177,7 +225,7 @@ def api_ask(request):
                     embedding_mode=embedding_mode,
                 )
                 print("Background indexing result:", res)
-            except Exception as e:
+            except Exception as e:  # Log; surface errors later via status polling
                 print(f"Indexing thread for {repo_url} failed: {e}")
 
         threading.Thread(target=_start_index_task, daemon=True).start()
@@ -188,10 +236,11 @@ def api_ask(request):
             }
         )
 
-    # Handle question answering
+    # --- Question answering flow ---
     if not question:
         return JsonResponse({"answer": "A question is required."})
 
+    # Allow lightweight reset via natural language prompt
     if "clear" in question.lower() or "reset" in question.lower():
         embedder.clear_indexing_state(repo_url, persist_dir=CHROMA_PERSIST_DIR)
         return JsonResponse(
@@ -201,6 +250,7 @@ def api_ask(request):
         )
 
     try:
+        # Delegate retrieval + answer synthesis to QA module
         result = answer_question(
             question,
             repo_url,
@@ -209,12 +259,10 @@ def api_ask(request):
             embedding_mode=embedding_mode,
             google_api_key=GOOGLE_API_KEY,
         )
-        # Normalize for backward response shape
-        if result.get("status") == "success":
-            return JsonResponse(result)
-        else:
-            return JsonResponse(result)
+        # Response already normalized by qa_module; return directly
+        return JsonResponse(result)
     except Exception as e:  # noqa: BLE001
+        # Defensive catch-all to avoid exposing traceback to client
         return JsonResponse(
             {
                 "answer": f"An error occurred while processing your question: {e}",
@@ -225,7 +273,16 @@ def api_ask(request):
 
 @csrf_exempt
 def api_embedding_config(request):
-    """API endpoint to get and set embedding configuration."""
+    """Manage and diagnose embedding configuration.
+
+    GET: Return current embedding engine metadata (mode, provider, dimensions if known).
+    POST: Accepts JSON with an 'action' key:
+        * set_mode   – Switch between 'local' and 'remote' embedding backends.
+        * test_local – Attempt to generate a trivial embedding using the local model.
+        * test_remote – Same, but invoking remote provider / API.
+
+    Returns structured JSON suitable for UI control panels.
+    """
     if request.method == "GET":
         return JsonResponse(embedder.get_embedding_info())
 
@@ -234,12 +291,15 @@ def api_embedding_config(request):
             body = json.loads(request.body.decode("utf-8"))
             action = body.get("action")
 
+            # Hot-switch embedding backend (non-persistent)
             if action == "set_mode":
                 new_mode = body.get("mode")
                 if new_mode in ["local", "remote"]:
-                    # Update environment variable (note: this only affects current process)
+                    # Process-level override
                     os.environ["EMBEDDING_MODE"] = new_mode
-                    embedder.EMBEDDING_MODE = new_mode
+                    embedder.EMBEDDING_MODE = (
+                        new_mode  # Update module global for runtime
+                    )
                     return JsonResponse(
                         {
                             "status": "success",
@@ -255,9 +315,8 @@ def api_embedding_config(request):
                         }
                     )
 
-            elif action == "test_local":
+            elif action == "test_local":  # Smoke test the local model pipeline
                 try:
-                    # Test if local embedding model can be loaded
                     test_embeddings = embedder.get_embeddings_local(["test"])
                     return JsonResponse(
                         {
@@ -274,9 +333,8 @@ def api_embedding_config(request):
                         }
                     )
 
-            elif action == "test_remote":
+            elif action == "test_remote":  # Smoke test remote API reachability/contract
                 try:
-                    # Test if remote embedding API is working
                     test_embeddings = embedder.get_embeddings_remote(
                         ["test"], "RETRIEVAL_QUERY"
                     )
@@ -295,7 +353,7 @@ def api_embedding_config(request):
                         }
                     )
 
-            else:
+            else:  # Fallback for unsupported actions
                 return JsonResponse(
                     {
                         "status": "error",
@@ -306,5 +364,5 @@ def api_embedding_config(request):
         except json.JSONDecodeError:
             return HttpResponseBadRequest("Invalid JSON")
 
-    else:
+    else:  # Reject non-GET/POST verbs
         return HttpResponseBadRequest("GET or POST required")

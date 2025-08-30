@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import base64
 import requests
+import re
 from urllib.parse import urlparse
 from typing import Optional, List, Dict
 
@@ -11,10 +12,48 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 
 def parse_github_url(repo_url: str):
-    """Return (owner, repo) tuple from a GitHub repository URL."""
-    path = urlparse(repo_url).path
-    path = path.removesuffix(".git")
-    owner, repo = path.lstrip("/").split("/")[:2]
+    """Return normalized (owner, repo) from a GitHub URL in varied forms.
+
+    Normalization handled:
+      - Leading/trailing whitespace.
+      - Optional scheme (assumes https if missing).
+      - http:// or https:// treated identically.
+      - Trailing slashes removed.
+      - Optional .git suffix removed.
+      - Accepts extra path segments (e.g., /tree/main) – only first two used.
+      - Supports scp-like form: git@github.com:owner/repo(.git)
+
+    Raises ValueError if owner/repo cannot be extracted.
+    """
+    if not repo_url or not isinstance(repo_url, str):  # Basic type guard
+        raise ValueError("Invalid repository URL: expected non-empty string")
+
+    raw = repo_url.strip()
+
+    # Handle scp-like syntax: git@github.com:owner/repo.git
+    if raw.startswith("git@"):
+        # Split at first ':' after host
+        try:
+            path_part = raw.split(":", 1)[1]
+        except IndexError as e:  # noqa: BLE001
+            raise ValueError(f"Malformed GitHub scp-style URL: {repo_url}") from e
+        path = path_part
+    else:
+        # Prepend scheme if missing (treat bare github.com/... as https)
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+            raw = "https://" + raw.lstrip("/")
+        parsed = urlparse(raw)
+        # If user passed something like github.com/owner/repo (no scheme), urlparse would put it in path – handled above.
+        path = parsed.path or ""
+
+    # Strip query/fragment if any leaked in earlier
+    path = path.split("?")[0].split("#")[0]
+    # Normalize suffixes and separators
+    path = path.removesuffix(".git").rstrip("/").lstrip("/")
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) < 2:
+        raise ValueError(f"Could not parse owner/repo from URL: {repo_url}")
+    owner, repo = segments[0].lower(), segments[1].lower()
     return owner, repo
 
 
@@ -74,3 +113,31 @@ def get_file_content(repo_url: str, relative_file_path: str) -> Optional[str]:
 
 
 __all__ = ["parse_github_url", "fetch_repo_tree", "get_file_content"]
+
+
+def fetch_json(url: str, headers: Dict[str, str]):
+    """Thin helper around requests.get().json() to keep _get_latest_commit concise."""
+    import requests
+
+    return requests.get(url, headers=headers).json()
+
+
+def _get_latest_commit(repo_url: str) -> str | None:
+    """Resolve the current HEAD commit SHA for the repo's default branch.
+
+    Used to tie a generated summary to a specific repository state for potential
+    staleness detection. Returns None if token missing or any API failure occurs.
+    """
+    if not GITHUB_TOKEN:
+        return None  # Anonymous requests would be rate limited / less reliable
+    try:
+        owner, repo = parse_github_url(repo_url)
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        repo_api = f"https://api.github.com/repos/{owner}/{repo}"
+        repo_info = fetch_json(repo_api, headers)
+        default_branch = repo_info.get("default_branch", "main")
+        ref_url = f"{repo_api}/git/refs/heads/{default_branch}"
+        ref = fetch_json(ref_url, headers)
+        return ref.get("object", {}).get("sha")
+    except Exception:  # noqa: BLE001 – treat failure as non-fatal
+        return None

@@ -59,7 +59,8 @@ def classify_question(question: str) -> str:
         ],
     }
     try:
-        model = _embedder._load_classifier_model()  # type: ignore[attr-defined]
+        # type: ignore[attr-defined]
+        model = _embedder._load_classifier_model()
         with _classification_lock:
             q_emb = model.encode([question], normalize_embeddings=True)[0]
             scores = {}
@@ -170,7 +171,8 @@ def _group_unit_docs(
         content_parts = []
         if fp in file_level_map:
             content_parts.append(
-                f"# FILE CONTEXT: {fp}\n" + file_level_map[fp]["document"] + "\n\n"
+                f"# FILE CONTEXT: {fp}\n" +
+                file_level_map[fp]["document"] + "\n\n"
             )
         content_parts.append(f"# SELECTED FUNCTIONS / CLASSES FROM {fp}\n")
         min_line = None
@@ -180,8 +182,7 @@ def _group_unit_docs(
             min_line = (
                 m.get("start_line")
                 if min_line is None
-                else min(min_line, m.get("start_line"))
-            )
+                else min(min_line, m.get("start_line")))
             max_line = (
                 m.get("end_line")
                 if max_line is None
@@ -258,7 +259,8 @@ def query_repository_advanced(
         )
         print(f"[PIPELINE] Retrieved {len(unit_docs)} unit docs")
         grouped = _group_unit_docs(unit_docs)
-        print(f"[PIPELINE] Grouped into {len(grouped)} grouped docs (low-level)")
+        print(
+            f"[PIPELINE] Grouped into {len(grouped)} grouped docs (low-level)")
         return {"classification": classification, "documents": grouped, "debug": debug}
 
     # High-level: stage1 file-level retrieval
@@ -286,7 +288,8 @@ def query_repository_advanced(
 
     selected_files = [d["metadata"]["file_path"] for d in file_docs]
     debug["selected_files"] = selected_files
-    print(f"[PIPELINE] Stage1 selected {len(selected_files)} files: {selected_files}")
+    print(
+        f"[PIPELINE] Stage1 selected {len(selected_files)} files: {selected_files}")
 
     per_file_units: List[Dict] = []
     for fp in selected_files:

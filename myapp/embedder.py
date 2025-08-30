@@ -32,7 +32,8 @@ except Exception:  # pragma: no cover - optional dependency errors handled later
 
 # --- Configuration ---
 # Embedding Configuration (unit-level and file-level)
-EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "remote")  # "local" or "remote"
+EMBEDDING_MODE = os.environ.get(
+    "EMBEDDING_MODE", "remote")  # "local" or "remote"
 LOCAL_EMBEDDING_MODEL = (
     "nomic-ai/nomic-embed-text-v1.5"  # Nomic model for local embedding
 )
@@ -45,7 +46,8 @@ LOCAL_EMBEDDING_DEVICE = os.environ.get(
 )  # "cpu" or "cuda"
 
 # File-level dual indexing configuration
-FILE_LEVEL_MAX_CHARS = int(os.environ.get("REPO_EXPLAINER_FILE_MAX_CHARS", 8000))
+FILE_LEVEL_MAX_CHARS = int(os.environ.get(
+    "REPO_EXPLAINER_FILE_MAX_CHARS", 8000))
 FILE_LEVEL_WINDOW_TARGET = int(
     os.environ.get("REPO_EXPLAINER_FILE_WINDOW_CHARS", 4000)
 )  # Target size for windowed file chunks
@@ -58,7 +60,8 @@ MAX_TOTAL_GROUPED_CONTEXT_CHARS = int(
 
 # Retrieval tuning
 HIGH_LEVEL_TOP_K_FILES = int(os.environ.get("REPO_EXPLAINER_TOP_K_FILES", 8))
-HIGH_LEVEL_UNIT_PER_FILE = int(os.environ.get("REPO_EXPLAINER_UNITS_PER_FILE", 6))
+HIGH_LEVEL_UNIT_PER_FILE = int(
+    os.environ.get("REPO_EXPLAINER_UNITS_PER_FILE", 6))
 
 # Classifier model (separate from embedding model so we don't interfere with primary embedding pipeline)
 CLASSIFIER_MODEL_NAME = os.environ.get(
@@ -128,7 +131,8 @@ DENY_DIR_NAMES = {
 }
 
 # Max file size (bytes) to consider for indexing (default 200 KB)
-MAX_FILE_SIZE_BYTES = int(os.environ.get("REPO_EXPLAINER_MAX_FILE_SIZE", 200 * 1024))
+MAX_FILE_SIZE_BYTES = int(os.environ.get(
+    "REPO_EXPLAINER_MAX_FILE_SIZE", 200 * 1024))
 
 # Generic (non-Python) code splitting configuration
 CODE_SPLIT_CHUNK_SIZE = int(
@@ -184,7 +188,8 @@ def _is_probably_binary(path: Path, sample_size: int = 4096) -> bool:
             if b"\x00" in chunk:
                 return True
             # Heuristic: proportion of non-text bytes
-            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
+            text_chars = bytearray(
+                {7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
             nontext = sum(1 for b in chunk if b not in text_chars)
             return (nontext / max(1, len(chunk))) > 0.30
     except Exception:
@@ -307,7 +312,8 @@ def _load_local_embedding_model():
             device=LOCAL_EMBEDDING_DEVICE,
             trust_remote_code=True,
         )
-        print(f"Local embedding model loaded successfully on {LOCAL_EMBEDDING_DEVICE}")
+        print(
+            f"Local embedding model loaded successfully on {LOCAL_EMBEDDING_DEVICE}")
         return _local_model, None
     except ImportError:
         raise ImportError(
@@ -350,7 +356,7 @@ def get_embeddings_local(texts: List[str]) -> List[List[float]]:
     # Process in batches for memory efficiency
     all_embeddings = []
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch_texts = texts[i : i + EMBEDDING_BATCH_SIZE]
+        batch_texts = texts[i: i + EMBEDDING_BATCH_SIZE]
         print(
             f"Processing local embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
         )
@@ -370,7 +376,8 @@ def get_embeddings_local(texts: List[str]) -> List[List[float]]:
                 time.sleep(0.1)
 
         except Exception as e:
-            print(f"Fatal error embedding batch locally: {e}. Stopping indexing.")
+            print(
+                f"Fatal error embedding batch locally: {e}. Stopping indexing.")
             raise e
 
     return all_embeddings
@@ -391,7 +398,7 @@ def get_embeddings_remote(
     all_embeddings = []
 
     for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch_texts = texts[i : i + EMBEDDING_BATCH_SIZE]
+        batch_texts = texts[i: i + EMBEDDING_BATCH_SIZE]
 
         print(
             f"Processing remote embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
@@ -411,11 +418,13 @@ def get_embeddings_remote(
             headers = {"Content-Type": "application/json"}
             data = {"requests": requests_payload}
 
-            response = requests.post(url, json=data, headers=headers, timeout=60)
+            response = requests.post(
+                url, json=data, headers=headers, timeout=60)
             response.raise_for_status()
             result = response.json()
 
-            batch_embeddings = [item["values"] for item in result["embeddings"]]
+            batch_embeddings = [item["values"]
+                                for item in result["embeddings"]]
             all_embeddings.extend(batch_embeddings)
 
             # Increased sleep time to avoid hitting API rate limits.
@@ -462,7 +471,8 @@ def _read_gitignore(repo_path: Path) -> Optional[pathspec.PathSpec]:
     if not gi.exists():
         return None
     with gi.open("r", encoding="utf-8", errors="ignore") as f:
-        lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+        lines = [l.strip()
+                 for l in f if l.strip() and not l.strip().startswith("#")]
     return pathspec.PathSpec.from_lines("gitwildmatch", lines)
 
 
@@ -478,8 +488,10 @@ def _clone_repo(repo_url: str, dst: Path) -> Optional[str]:
         shutil.rmtree(dst)
     dst.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.check_call(["git", "clone", "--depth", "1", repo_url, str(dst)])
-        proc = subprocess.check_output(["git", "-C", str(dst), "rev-parse", "HEAD"])
+        subprocess.check_call(
+            ["git", "clone", "--depth", "1", repo_url, str(dst)])
+        proc = subprocess.check_output(
+            ["git", "-C", str(dst), "rev-parse", "HEAD"])
         return proc.decode().strip()
     except Exception as e:
         print(f"Error cloning repo: {e}")
@@ -503,7 +515,7 @@ def _extract_python_units(path: Path) -> List[Dict]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             start = node.lineno
             end = getattr(node, "end_lineno", start)
-            code = "\n".join(src.splitlines()[start - 1 : end])
+            code = "\n".join(src.splitlines()[start - 1: end])
             units.append(
                 {
                     "name": node.name,
@@ -564,7 +576,8 @@ def _derive_block_name(block: str, language_hint: Optional[str], index: int) -> 
             r"func\s+([A-Za-z_][A-Za-z0-9_]*)",
         ]
     elif language_hint == "RUST":
-        patterns = [r"fn\s+([a-zA-Z_][A-Za-z0-9_]*)", r"struct\s+([A-Z][A-Za-z0-9_]*)"]
+        patterns = [r"fn\s+([a-zA-Z_][A-Za-z0-9_]*)",
+                    r"struct\s+([A-Z][A-Za-z0-9_]*)"]
     elif language_hint == "PHP":
         patterns = [
             r"function\s+([A-Za-z_][A-Za-z0-9_]*)",
@@ -732,7 +745,8 @@ def _group_units_into_file_chunks(
     if not units:
         # Fall back to simple chunking of entire file text
         chunks = []
-        texts = _chunk_text(full_src, max_chars=FILE_LEVEL_WINDOW_TARGET, overlap=200)
+        texts = _chunk_text(
+            full_src, max_chars=FILE_LEVEL_WINDOW_TARGET, overlap=200)
         for i, t in enumerate(texts):
             chunks.append((t, i, 1, len(full_src.splitlines())))
         return chunks
@@ -768,7 +782,8 @@ def _group_units_into_file_chunks(
             flush(units[i - 1]["end_line"])
             # Start new chunk, optionally overlap previous N functions
             if FILE_LEVEL_OVERLAP_FUNCTIONS > 0 and i > 0:
-                overlap_units = units[max(0, i - FILE_LEVEL_OVERLAP_FUNCTIONS) : i]
+                overlap_units = units[max(
+                    0, i - FILE_LEVEL_OVERLAP_FUNCTIONS): i]
                 for ou in overlap_units:
                     osep = f"\n\n# ---- {ou['type'].upper()} {ou['name']} (lines {ou['start_line']}-{ou['end_line']}) [overlap] ----\n"
                     current_parts.append(osep + ou["code"].rstrip())
@@ -810,7 +825,8 @@ def _write_chunks_manifest(
     dest = Path(persist_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
-    safe_repo = repo_url.replace("://", "_").replace("/", "_").replace(":", "_")
+    safe_repo = repo_url.replace(
+        "://", "_").replace("/", "_").replace(":", "_")
     manifest_name = filename or f"{safe_repo}_embedding_chunks.jsonl"
     manifest_path = dest / manifest_name
 
@@ -951,7 +967,8 @@ def index_repository(
                         units = _extract_generic_code_units(fp)
                         if not units:
                             units = [_fallback_file_unit(fp)]  # final fallback
-                    rel_path_str = str(fp.relative_to(tmpdir)).replace("\\", "/")
+                    rel_path_str = str(fp.relative_to(
+                        tmpdir)).replace("\\", "/")
                     # Add to repo map
                     try:
                         size_bytes = fp.stat().st_size
@@ -985,7 +1002,8 @@ def index_repository(
                     )
                     for fch_text, fch_idx, fch_start, fch_end in file_chunks:
                         doc = (
-                            f"File Chunk: {rel_path_str}\nChunk Index: {fch_idx}\nLines: {fch_start}-{fch_end}\n"  # header
+                            # header
+                            f"File Chunk: {rel_path_str}\nChunk Index: {fch_idx}\nLines: {fch_start}-{fch_end}\n"
                             f"```\n{fch_text}\n```"
                         )
                         texts_to_embed.append(doc)
@@ -1010,7 +1028,8 @@ def index_repository(
                         if u.get("already_chunked"):
                             # Already a final logical chunk
                             doc = (
-                                f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"  # header
+                                # header
+                                f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"
                                 f"```\n{u['code']}\n```"
                             )
                             texts_to_embed.append(doc)
@@ -1028,12 +1047,15 @@ def index_repository(
                                     "embedding_mode": mode,
                                 }
                             )
-                            log_f.write(f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
+                            log_f.write(
+                                f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
                             continue
-                        unit_chunks = _chunk_text(u["code"])  # Python or large fallback
+                        # Python or large fallback
+                        unit_chunks = _chunk_text(u["code"])
                         for idx, ch in enumerate(unit_chunks):
                             doc = (
-                                f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"  # header
+                                # header
+                                f"Unit: {u['name']}\nType: {u['type']}\nLines: {u['start_line']}-{u['end_line']}\n"
                                 f"```\n{ch}\n```"
                             )
                             texts_to_embed.append(doc)
@@ -1051,7 +1073,8 @@ def index_repository(
                                     "embedding_mode": mode,
                                 }
                             )
-                            log_f.write(f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
+                            log_f.write(
+                                f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
 
         if not texts_to_embed:
             statuses[repo_url] = {
@@ -1184,7 +1207,8 @@ def query_repository(
         return []
 
     try:
-        query_embedding = get_embeddings([question], "RETRIEVAL_QUERY", mode)[0]
+        query_embedding = get_embeddings(
+            [question], "RETRIEVAL_QUERY", mode)[0]
     except Exception as e:
         print(f"Failed to embed query: {e}")
         return []
@@ -1241,7 +1265,7 @@ HIGH_LEVEL_LABEL = "high_level"
 _classification_lock = threading.Lock()
 
 
-## Advanced retrieval functions moved entirely to retrieval.py (no shims kept).
+# Advanced retrieval functions moved entirely to retrieval.py (no shims kept).
 
 
 # =============================
@@ -1252,7 +1276,7 @@ _classification_lock = threading.Lock()
 REPO_MAP_SUFFIX = "_repo_map.json"
 
 
-## Repo map helpers removed; import directly from myapp.repo_map in callers.
+# Repo map helpers removed; import directly from myapp.repo_map in callers.
 
 
 # Public re-exports for external imports relying on old locations.
