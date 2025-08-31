@@ -42,6 +42,35 @@ def get_repo_map(repo_url: str, persist_dir: str = "chroma_persist") -> Optional
         return None
 
 
+def _write_repo_map(
+    repo_url: str,
+    commit: Optional[str],
+    files: List[Dict],
+    persist_dir: str = "chroma_persist",
+) -> Optional[Path]:
+    """Persist a lightweight repository map (paths + unit spans) to disk.
+
+    This reintroduces functionality that embedder.py optionally calls after
+    indexing. It's intentionally private (prefixed with underscore) so that
+    external code uses public helpers instead.
+    """
+    try:
+        path = _repo_map_path(repo_url, persist_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "repo_url": repo_url,
+            "commit": commit,
+            "generated_at": time.time(),
+            "files": files,
+            "file_count": len(files),
+        }
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return path
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def get_repo_map_summary(
     repo_url: str,
     persist_dir: str = "chroma_persist",

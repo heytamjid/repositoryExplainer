@@ -36,58 +36,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+from . import config
 from .github_utils import (
     fetch_repo_tree,
     get_file_content,
     _get_latest_commit,
 )
 from .json_utils import parse_identified
-
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")  # Required for Gemini access
-GITHUB_TOKEN = os.environ.get(
-    "GITHUB_TOKEN"
-)  # Enables higher GitHub rate limits + commit lookups
-
-# LLM configuration knobs (kept local to summarization so they can diverge from other modules if needed)
-LLM_MODEL_NAME = (
-    "gemini-2.5-flash"  # Fast, cost‑aware model variant for summarization tasks
-)
-LLM_TEMPERATURE_IDENTIFY = 0.1  # Low temp for deterministic file categorization output
-LLM_TEMPERATURE_GENERATE = (
-    0.4  # Slightly creative but still grounded for documentation prose
-)
-MAX_TOTAL_CONTEXT_CHARS = (
-    50000  # Hard cap on concatenated file content to limit prompt size & cost
-)
-
-SUMMARY_CACHE_FILE = (
-    "summaries.json"  # Flat JSON store (simple persistence, no DB dependency)
-)
-
-SECTION_DEFINITIONS: List[Dict[str, Any]] = (
-    [  # Stable section schema used by UI & LLM prompts
-        {
-            "id": "purpose_scope",  # High‑level intent / README perspective
-            "title": "Purpose & Scope",
-            "description": "README, high-level documentation, and files that describe why the project exists and what it does.",
-        },
-        {
-            "id": "system_architecture",  # Entrypoints, config, routing, infra hints
-            "title": "System Architecture Overview",
-            "description": "Configuration files, server entrypoints, routing, and high-level architecture information.",
-        },
-        {
-            "id": "core_components",  # Core business/domain logic modules
-            "title": "Core Components & Business Logic",
-            "description": "Primary source code modules and packages implementing the core features and business logics.",
-        },
-        {
-            "id": "data_model",  # Data flow & persistence concerns
-            "title": "Data Flow",
-            "description": "Data flow across the system, database schemas and database interaction layers.",
-        },
-    ]
-)
 
 
 # ---------------- Cache Helpers -----------------
@@ -97,10 +52,10 @@ def _read_summaries() -> Dict[str, Any]:
     Returns an empty dict if file is missing or corrupt to keep the system
     resilient (caller treats absence as cache miss).
     """
-    if not os.path.exists(SUMMARY_CACHE_FILE):
+    if not os.path.exists(config.SUMMARY_CACHE_FILE):
         return {}
     try:
-        with open(SUMMARY_CACHE_FILE, "r", encoding="utf-8") as f:
+        with open(config.SUMMARY_CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (IOError, json.JSONDecodeError):  # Silent failure -> recomputation path
         return {}
@@ -118,7 +73,7 @@ def _write_summary(repo_url: str, commit_hash: str, summary_data: Dict[str, Any]
         "commit": commit_hash,  # Links summary to repository state
         "summary": summary_data,  # Section -> rendered HTML/Markdown fragment
     }
-    with open(SUMMARY_CACHE_FILE, "w", encoding="utf-8") as f:
+    with open(config.SUMMARY_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(summaries, f, indent=2)
 
 
@@ -132,7 +87,7 @@ def get_summary(repo_url: str) -> Dict[str, Any] | None:
 
 
 # --------------- LLM Categorization ---------------
-def get_important_files_by_category(repo_tree, sections=SECTION_DEFINITIONS):
+def get_important_files_by_category(repo_tree, sections=config.SECTION_DEFINITIONS):
     """Use an LLM to map repo files to documentation sections.
 
     Strategy:
@@ -172,9 +127,9 @@ Repository File List:
     try:
         # Build chain: prompt -> model -> raw string
         llm_identify = ChatGoogleGenerativeAI(
-            model=LLM_MODEL_NAME,
-            temperature=LLM_TEMPERATURE_IDENTIFY,
-            google_api_key=GOOGLE_API_KEY,
+            model=config.LLM_MODEL_NAME,
+            temperature=config.LLM_TEMPERATURE_IDENTIFY,
+            google_api_key=config.GOOGLE_API_KEY,
         )
         chain_identify = (
             ChatPromptTemplate.from_template(prompt_template_files)
@@ -212,7 +167,7 @@ Repository File List:
 
 
 def generate_documentation(
-    repo_url: str, files_by_category, sections=SECTION_DEFINITIONS
+    repo_url: str, files_by_category, sections=config.SECTION_DEFINITIONS
 ):
     """Produce per‑section documentation using retrieved file contents.
 
@@ -234,14 +189,14 @@ def generate_documentation(
     context_str = ""
     current_total_chars = 0
     for file_path in all_files:
-        if current_total_chars >= MAX_TOTAL_CONTEXT_CHARS:
+        if current_total_chars >= config.MAX_TOTAL_CONTEXT_CHARS:
             break  # Enforce global context character budget
         content = get_file_content(repo_url, file_path)
         if content:
             snippet = (
                 f"\n\n--- Start: {file_path} ---\n{content}\n--- End: {file_path} ---\n"
             )
-            if current_total_chars + len(snippet) <= MAX_TOTAL_CONTEXT_CHARS:
+            if current_total_chars + len(snippet) <= config.MAX_TOTAL_CONTEXT_CHARS:
                 context_str += snippet
                 current_total_chars += len(snippet)
 
@@ -253,9 +208,9 @@ def generate_documentation(
     try:
         # Chain for generation: templated system + human context -> LLM -> text
         llm_generate = ChatGoogleGenerativeAI(
-            model=LLM_MODEL_NAME,
-            temperature=LLM_TEMPERATURE_GENERATE,
-            google_api_key=GOOGLE_API_KEY,
+            model=config.LLM_MODEL_NAME,
+            temperature=config.LLM_TEMPERATURE_GENERATE,
+            google_api_key=config.GOOGLE_API_KEY,
         )
         system_prompt = """You are an expert technical writer. Your task is to create a high-level, structured, and clear documentation for a software repository based on the provided file contents.
 
@@ -322,9 +277,11 @@ def generate_or_get_summary(
         return None, None, False
 
     latest_commit = _get_latest_commit(repo_url)
-    files_by_category = get_important_files_by_category(repo_tree, SECTION_DEFINITIONS)
+    files_by_category = get_important_files_by_category(
+        repo_tree, config.SECTION_DEFINITIONS
+    )
     documentation = generate_documentation(
-        repo_url, files_by_category, SECTION_DEFINITIONS
+        repo_url, files_by_category, config.SECTION_DEFINITIONS
     )
     if latest_commit and documentation:
         _write_summary(repo_url, latest_commit, documentation)
@@ -332,7 +289,6 @@ def generate_or_get_summary(
 
 
 __all__ = [
-    "SECTION_DEFINITIONS",
     "get_summary",
     "get_important_files_by_category",
     "generate_documentation",

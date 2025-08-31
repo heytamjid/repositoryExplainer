@@ -24,52 +24,13 @@ from django.views.decorators.csrf import (
 )  # Allow API POSTs without CSRF token
 
 
-from . import embedder  # Embedding & indexing orchestration module
+from . import embedder, config
 from .summar import (
-    SECTION_DEFINITIONS,
     generate_or_get_summary,
 )
 
 # Core QA pipeline (retrieval + LLM synthesis)
 from .qa_module import answer_question
-
-
-#############################################
-# Configuration & Constants
-#############################################
-# External service credentials (must be set in environment for full functionality)
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-
-# LLM configuration (values primarily used in other modules, kept here for clarity)
-LLM_MODEL_NAME = "gemini-2.5-flash"  # Default conversational / reasoning model
-# Low randomness for deterministic identification tasks
-LLM_TEMPERATURE_IDENTIFY = 0.1
-LLM_TEMPERATURE_GENERATE = 0.4  # Slightly higher for answer synthesis
-MAX_TOTAL_CONTEXT_CHARS = 100000  # Soft limit to prevent runaway prompt sizes
-
-# Vector / persistence layer configuration
-CHROMA_PERSIST_DIR = "chroma_persist"  # On-disk location for Chroma DB
-CHROMA_COLLECTION_NAME = (
-    "repo_functions"  # Logical collection name per repository code units
-)
-SUMMARY_CACHE_FILE = "summaries.json"  # JSON cache for generated repo summaries
-
-# SECTION_DEFINITIONS now imported from summar module
-
-
-# Summary cache helpers now provided by summar module
-
-
-# --- GitHub API Functions ---
-# (Now imported from github_utils; previous inline implementations removed to avoid duplication.)
-
-
-# --- LLM Interaction Functions (No changes here) ---
-# get_important_files_by_category now provided by summar module
-
-
-# generate_documentation now provided by summar module
 
 
 # --- Django Views ---
@@ -100,7 +61,7 @@ def home(request):
         force_resummarize = request.POST.get("force_resummarize") == "true"
 
         if repo_url:
-            if not GITHUB_TOKEN or not GOOGLE_API_KEY:
+            if not config.GITHUB_TOKEN or not config.GOOGLE_API_KEY:
                 # Fail early if runtime configuration incomplete
                 error = "Server configuration error: API keys are missing."
             else:
@@ -122,7 +83,7 @@ def home(request):
             "documentation": documentation,
             "error": error,
             "repo_url": repo_url,
-            "sections": SECTION_DEFINITIONS,
+            "sections": config.SECTION_DEFINITIONS,
             "is_cached": is_cached,
             "cached_commit": cached_commit,
             "embedding_info": embedding_info,
@@ -198,13 +159,13 @@ def api_ask(request):
     # --- Poll for existing indexing lifecycle status ---
     if action == "status":
         repo_status_data = embedder.get_indexing_status(
-            repo_url, persist_dir=CHROMA_PERSIST_DIR
+            repo_url, persist_dir=config.CHROMA_PERSIST_DIR
         )
         return JsonResponse(
             {
                 "status": repo_status_data.get("status", "not_indexed"),
                 "embedding_mode": repo_status_data.get(
-                    "embedding_mode", embedder.EMBEDDING_MODE
+                    "embedding_mode", embedder.config.EMBEDDING_MODE
                 ),
             }
         )
@@ -220,8 +181,8 @@ def api_ask(request):
             try:
                 res = embedder.index_repository(
                     repo_url,
-                    persist_dir=CHROMA_PERSIST_DIR,
-                    collection_name=CHROMA_COLLECTION_NAME,
+                    persist_dir=config.CHROMA_PERSIST_DIR,
+                    collection_name=config.CHROMA_COLLECTION_NAME,
                     embedding_mode=embedding_mode,
                 )
                 print("Background indexing result:", res)
@@ -232,7 +193,7 @@ def api_ask(request):
         return JsonResponse(
             {
                 "status": "indexing_started",
-                "embedding_mode": embedding_mode or embedder.EMBEDDING_MODE,
+                "embedding_mode": embedding_mode or config.EMBEDDING_MODE,
             }
         )
 
@@ -242,7 +203,7 @@ def api_ask(request):
 
     # Allow lightweight reset via natural language prompt
     if "clear" in question.lower() or "reset" in question.lower():
-        embedder.clear_indexing_state(repo_url, persist_dir=CHROMA_PERSIST_DIR)
+        embedder.clear_indexing_state(repo_url, persist_dir=config.CHROMA_PERSIST_DIR)
         return JsonResponse(
             {
                 "answer": f"Indexing state cleared for {repo_url}. You can now ask questions again."
@@ -254,10 +215,10 @@ def api_ask(request):
         result = answer_question(
             question,
             repo_url,
-            persist_dir=CHROMA_PERSIST_DIR,
-            collection_name=CHROMA_COLLECTION_NAME,
+            persist_dir=config.CHROMA_PERSIST_DIR,
+            collection_name=config.CHROMA_COLLECTION_NAME,
             embedding_mode=embedding_mode,
-            google_api_key=GOOGLE_API_KEY,
+            google_api_key=config.GOOGLE_API_KEY,
         )
         # Response already normalized by qa_module; return directly
         return JsonResponse(result)

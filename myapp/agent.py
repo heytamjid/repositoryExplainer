@@ -14,8 +14,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from . import repo_map as repo_map_utils
+from . import config
 
-LLM_MODEL_NAME = "gemini-2.5-flash"
+LLM_MODEL_NAME = config.LLM_MODEL_NAME
 MAX_LOOKUP_ITERS = 2
 
 

@@ -20,161 +20,21 @@ import ast
 # We re-export key functions for backward compatibility so existing imports
 # (`from myapp import embedder`) continue to work unchanged.
 from . import retrieval as _retrieval  # type: ignore
-from . import repo_map as _repo_map  # type: ignore
+from . import repo_map as _repo_map
+from .repo_map import _write_repo_map
 from .github_utils import parse_github_url as gh_parse_url  # unified helper
-
-# New import for language-aware splitting
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
-except Exception:  # pragma: no cover - optional dependency errors handled later
-    RecursiveCharacterTextSplitter = None  # type: ignore
-    Language = None  # type: ignore
-
-# --- Configuration ---
-# Embedding Configuration (unit-level and file-level)
-EMBEDDING_MODE = os.environ.get(
-    "EMBEDDING_MODE", "remote")  # "local" or "remote"
-LOCAL_EMBEDDING_MODEL = (
-    "nomic-ai/nomic-embed-text-v1.5"  # Nomic model for local embedding
-)
-REMOTE_EMBEDDING_MODEL = "models/embedding-001"  # Google Gemini model
-EMBEDDING_TASK_TYPE = Literal["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"]
-EMBEDDING_BATCH_SIZE = 100
-EMBEDDING_DIMENSIONS = 768  # This may vary based on the model
-LOCAL_EMBEDDING_DEVICE = os.environ.get(
-    "LOCAL_EMBEDDING_DEVICE", "cpu"
-)  # "cpu" or "cuda"
-
-# File-level dual indexing configuration
-FILE_LEVEL_MAX_CHARS = int(os.environ.get(
-    "REPO_EXPLAINER_FILE_MAX_CHARS", 8000))
-FILE_LEVEL_WINDOW_TARGET = int(
-    os.environ.get("REPO_EXPLAINER_FILE_WINDOW_CHARS", 4000)
-)  # Target size for windowed file chunks
-FILE_LEVEL_OVERLAP_FUNCTIONS = int(
-    os.environ.get("REPO_EXPLAINER_FILE_OVERLAP_FUNCS", 1)
-)  # Number of functions to overlap between large file windows
-MAX_TOTAL_GROUPED_CONTEXT_CHARS = int(
-    os.environ.get("REPO_EXPLAINER_MAX_TOTAL_GROUPED", 60000)
+from . import config
+from .config import (
+    RecursiveCharacterTextSplitter,
+    Language,
+    EMBEDDING_TASK_TYPE,
+    FILE_LEVEL_WINDOW_TARGET,
+    FILE_LEVEL_OVERLAP_FUNCTIONS,
+    FILE_LEVEL_MAX_CHARS,
 )
 
-# Retrieval tuning
-HIGH_LEVEL_TOP_K_FILES = int(os.environ.get("REPO_EXPLAINER_TOP_K_FILES", 8))
-HIGH_LEVEL_UNIT_PER_FILE = int(
-    os.environ.get("REPO_EXPLAINER_UNITS_PER_FILE", 6))
 
-# Classifier model (separate from embedding model so we don't interfere with primary embedding pipeline)
-CLASSIFIER_MODEL_NAME = os.environ.get(
-    "REPO_EXPLAINER_CLASSIFIER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# --- Module-level State Management ---
-STATUS_FILE_NAME = "indexing_status.json"
 _index_lock = threading.Lock()
-
-# --- File exclusion / denylist configuration ---
-# Extensions, filenames and directory names we never want to index
-DENY_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".ico",
-    ".db",
-    ".sqlite",
-    ".sqlite3",
-    ".mp4",
-    ".mp3",
-    ".wav",
-    ".zip",
-    ".tar",
-    ".gz",
-    ".tgz",
-    ".exe",
-    ".dll",
-    ".so",
-    ".pyc",
-    ".class",
-    ".jar",
-    ".pdf",
-    ".woff",
-    ".woff2",
-    ".ttf",
-    ".otf",
-}
-
-# Specific file names to always skip
-DENY_FILENAMES = {"db.sqlite3", "thumbs.db"}
-
-# Directory names that are commonly noisy
-DENY_DIR_NAMES = {
-    "node_modules",
-    "venv",
-    ".venv",
-    "env",
-    "build",
-    "dist",
-    "target",
-    "out",
-    "public",
-    "static",
-    "media",
-    "__pycache__",
-    "coverage",
-    "vendor",
-    "bower_components",
-    ".next",
-    ".nuxt",
-    "django_bundles",
-    "django_bundle",
-}
-
-# Max file size (bytes) to consider for indexing (default 200 KB)
-MAX_FILE_SIZE_BYTES = int(os.environ.get(
-    "REPO_EXPLAINER_MAX_FILE_SIZE", 200 * 1024))
-
-# Generic (non-Python) code splitting configuration
-CODE_SPLIT_CHUNK_SIZE = int(
-    os.environ.get("REPO_EXPLAINER_CODE_CHUNK_SIZE", 1800)
-)  # Target characters per chunk
-CODE_SPLIT_CHUNK_OVERLAP = int(
-    os.environ.get("REPO_EXPLAINER_CODE_CHUNK_OVERLAP", 200)
-)  # Character overlap for continuity
-MAX_UNIT_CHARS = int(
-    os.environ.get("REPO_EXPLAINER_MAX_UNIT_CHARS", 6000)
-)  # Hard ceiling safeguard for any single unit (trim/split if exceeded)
-
-# Map file extensions to LangChain Language enum (best-effort; missing entries fallback to custom separators)
-LANG_EXT_MAP = {
-    ".js": "JS",
-    ".ts": "TS",
-    ".jsx": "JS",
-    ".tsx": "TS",
-    ".java": "JAVA",
-    ".go": "GO",
-    ".rs": "RUST",
-    ".php": "PHP",
-    ".rb": "RUBY",
-    ".c": "C",
-    ".h": "C",
-    ".cpp": "CPP",
-    ".cc": "CPP",
-    ".hpp": "CPP",
-    ".cs": "CSHARP",
-    ".swift": "SWIFT",
-    ".scala": "SCALA",
-    ".kt": "KOTLIN",
-    ".kts": "KOTLIN",
-    ".html": "HTML",
-    ".htm": "HTML",
-    ".css": "CSS",
-    ".md": "MARKDOWN",
-    ".json": "JSON",
-    ".xml": "XML",
-    ".yml": "YAML",
-    ".yaml": "YAML",
-}
 
 
 # Small helper to heuristically detect binary files by sampling the beginning bytes
@@ -188,8 +48,7 @@ def _is_probably_binary(path: Path, sample_size: int = 4096) -> bool:
             if b"\x00" in chunk:
                 return True
             # Heuristic: proportion of non-text bytes
-            text_chars = bytearray(
-                {7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
+            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)))
             nontext = sum(1 for b in chunk if b not in text_chars)
             return (nontext / max(1, len(chunk))) > 0.30
     except Exception:
@@ -215,23 +74,23 @@ def _should_skip_file(
             return True
 
         name_lower = path.name.lower()
-        if name_lower in DENY_FILENAMES:
+        if name_lower in config.DENY_FILENAMES:
             return True
 
         # Skip files inside noisy dirs (any path component matches)
         for p in path.parts:
-            if p.lower() in DENY_DIR_NAMES:
+            if p.lower() in config.DENY_DIR_NAMES:
                 return True
 
         # Skip by extension
         ext = path.suffix.lower()
-        if ext in DENY_EXTENSIONS:
+        if ext in config.DENY_EXTENSIONS:
             return True
 
         # Skip very large files
         try:
             size = path.stat().st_size
-            if size > MAX_FILE_SIZE_BYTES:
+            if size > config.MAX_FILE_SIZE_BYTES:
                 return True
         except Exception:
             return True
@@ -253,7 +112,7 @@ _classifier_model = None
 
 def _get_status_path(persist_dir: str) -> Path:
     """Gets the path to the persistent status file."""
-    return Path(persist_dir) / STATUS_FILE_NAME
+    return Path(persist_dir) / config.STATUS_FILE_NAME
 
 
 def _read_status(status_path: Path) -> Dict:
@@ -306,14 +165,15 @@ def _load_local_embedding_model():
     try:
         from sentence_transformers import SentenceTransformer
 
-        print(f"Loading local embedding model: {LOCAL_EMBEDDING_MODEL}")
+        print(f"Loading local embedding model: {config.EMBEDDING_MODEL_NAME_LOCAL}")
         _local_model = SentenceTransformer(
-            LOCAL_EMBEDDING_MODEL,
-            device=LOCAL_EMBEDDING_DEVICE,
+            config.EMBEDDING_MODEL_NAME_LOCAL,
+            device=config.LOCAL_EMBEDDING_DEVICE,
             trust_remote_code=True,
         )
         print(
-            f"Local embedding model loaded successfully on {LOCAL_EMBEDDING_DEVICE}")
+            f"Local embedding model loaded successfully on {config.LOCAL_EMBEDDING_DEVICE}"
+        )
         return _local_model, None
     except ImportError:
         raise ImportError(
@@ -332,9 +192,9 @@ def _load_classifier_model():
     try:
         from sentence_transformers import SentenceTransformer
 
-        print(f"Loading classifier model: {CLASSIFIER_MODEL_NAME}")
+        print(f"Loading classifier model: {config.CLASSIFIER_MODEL_NAME}")
         _classifier_model = SentenceTransformer(
-            CLASSIFIER_MODEL_NAME, device="cpu", trust_remote_code=True
+            config.CLASSIFIER_MODEL_NAME, device="cpu", trust_remote_code=True
         )
         return _classifier_model
     except ImportError:
@@ -355,10 +215,10 @@ def get_embeddings_local(texts: List[str]) -> List[List[float]]:
 
     # Process in batches for memory efficiency
     all_embeddings = []
-    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch_texts = texts[i: i + EMBEDDING_BATCH_SIZE]
+    for i in range(0, len(texts), config.EMBEDDING_BATCH_SIZE):
+        batch_texts = texts[i : i + config.EMBEDDING_BATCH_SIZE]
         print(
-            f"Processing local embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
+            f"Processing local embedding batch {i // config.EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + config.EMBEDDING_BATCH_SIZE - 1) // config.EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
         )
 
         try:
@@ -372,12 +232,11 @@ def get_embeddings_local(texts: List[str]) -> List[List[float]]:
             all_embeddings.extend(batch_embeddings.tolist())
 
             # Small delay to prevent overheating
-            if len(batch_texts) == EMBEDDING_BATCH_SIZE:
+            if len(batch_texts) == config.EMBEDDING_BATCH_SIZE:
                 time.sleep(0.1)
 
         except Exception as e:
-            print(
-                f"Fatal error embedding batch locally: {e}. Stopping indexing.")
+            print(f"Fatal error embedding batch locally: {e}. Stopping indexing.")
             raise e
 
     return all_embeddings
@@ -397,16 +256,16 @@ def get_embeddings_remote(
 
     all_embeddings = []
 
-    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch_texts = texts[i: i + EMBEDDING_BATCH_SIZE]
+    for i in range(0, len(texts), config.EMBEDDING_BATCH_SIZE):
+        batch_texts = texts[i : i + config.EMBEDDING_BATCH_SIZE]
 
         print(
-            f"Processing remote embedding batch {i // EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
+            f"Processing remote embedding batch {i // config.EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + config.EMBEDDING_BATCH_SIZE - 1) // config.EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
         )
 
         requests_payload = [
             {
-                "model": REMOTE_EMBEDDING_MODEL,
+                "model": config.REMOTE_EMBEDDING_MODEL,
                 "content": {"parts": [{"text": text}]},
                 "taskType": task_type,
             }
@@ -414,17 +273,15 @@ def get_embeddings_remote(
         ]
 
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{REMOTE_EMBEDDING_MODEL.split('/')[1]}:batchEmbedContents?key={api_key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.REMOTE_EMBEDDING_MODEL.split('/')[1]}:batchEmbedContents?key={api_key}"
             headers = {"Content-Type": "application/json"}
             data = {"requests": requests_payload}
 
-            response = requests.post(
-                url, json=data, headers=headers, timeout=60)
+            response = requests.post(url, json=data, headers=headers, timeout=60)
             response.raise_for_status()
             result = response.json()
 
-            batch_embeddings = [item["values"]
-                                for item in result["embeddings"]]
+            batch_embeddings = [item["values"] for item in result["embeddings"]]
             all_embeddings.extend(batch_embeddings)
 
             # Increased sleep time to avoid hitting API rate limits.
@@ -452,7 +309,7 @@ def get_embeddings(
         task_type: Task type for remote embeddings (ignored for local)
         mode: Override the global EMBEDDING_MODE ("local" or "remote")
     """
-    embedding_mode = mode or EMBEDDING_MODE
+    embedding_mode = mode or config.EMBEDDING_MODE
 
     print(f"Using {embedding_mode} embeddings for {len(texts)} texts")
 
@@ -471,8 +328,7 @@ def _read_gitignore(repo_path: Path) -> Optional[pathspec.PathSpec]:
     if not gi.exists():
         return None
     with gi.open("r", encoding="utf-8", errors="ignore") as f:
-        lines = [l.strip()
-                 for l in f if l.strip() and not l.strip().startswith("#")]
+        lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
     return pathspec.PathSpec.from_lines("gitwildmatch", lines)
 
 
@@ -488,10 +344,8 @@ def _clone_repo(repo_url: str, dst: Path) -> Optional[str]:
         shutil.rmtree(dst)
     dst.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.check_call(
-            ["git", "clone", "--depth", "1", repo_url, str(dst)])
-        proc = subprocess.check_output(
-            ["git", "-C", str(dst), "rev-parse", "HEAD"])
+        subprocess.check_call(["git", "clone", "--depth", "1", repo_url, str(dst)])
+        proc = subprocess.check_output(["git", "-C", str(dst), "rev-parse", "HEAD"])
         return proc.decode().strip()
     except Exception as e:
         print(f"Error cloning repo: {e}")
@@ -515,7 +369,7 @@ def _extract_python_units(path: Path) -> List[Dict]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             start = node.lineno
             end = getattr(node, "end_lineno", start)
-            code = "\n".join(src.splitlines()[start - 1: end])
+            code = "\n".join(src.splitlines()[start - 1 : end])
             units.append(
                 {
                     "name": node.name,
@@ -548,7 +402,7 @@ def _detect_language(path: Path) -> Optional[str]:
 
     We store enum name as string to avoid hard dependency if LangChain not present.
     """
-    return LANG_EXT_MAP.get(path.suffix.lower())
+    return config.LANG_EXT_MAP.get(path.suffix.lower())
 
 
 def _derive_block_name(block: str, language_hint: Optional[str], index: int) -> str:
@@ -576,8 +430,7 @@ def _derive_block_name(block: str, language_hint: Optional[str], index: int) -> 
             r"func\s+([A-Za-z_][A-Za-z0-9_]*)",
         ]
     elif language_hint == "RUST":
-        patterns = [r"fn\s+([a-zA-Z_][A-Za-z0-9_]*)",
-                    r"struct\s+([A-Z][A-Za-z0-9_]*)"]
+        patterns = [r"fn\s+([a-zA-Z_][A-Za-z0-9_]*)", r"struct\s+([A-Z][A-Za-z0-9_]*)"]
     elif language_hint == "PHP":
         patterns = [
             r"function\s+([A-Za-z_][A-Za-z0-9_]*)",
@@ -629,15 +482,15 @@ def _extract_generic_code_units(path: Path) -> List[Dict]:
                 "type": "file",
                 "start_line": 1,
                 "end_line": src.count("\n") + 1,
-                "code": src[:MAX_UNIT_CHARS],
+                "code": src[: config.MAX_UNIT_CHARS],
                 "already_chunked": True,
             }
         ]
 
     language_name = _detect_language(path)
     splitter_kwargs = {
-        "chunk_size": CODE_SPLIT_CHUNK_SIZE,
-        "chunk_overlap": CODE_SPLIT_CHUNK_OVERLAP,
+        "chunk_size": config.CODE_SPLIT_CHUNK_SIZE,
+        "chunk_overlap": config.CODE_SPLIT_CHUNK_OVERLAP,
     }
     splitter = None
     if language_name and Language is not None:
@@ -716,7 +569,7 @@ def _extract_generic_code_units(path: Path) -> List[Dict]:
         end_line = char_index_to_line(max(0, end_char - 1))
         name = _derive_block_name(text, language_name, i)
         # Enforce max unit size safeguard
-        trimmed_text = text[:MAX_UNIT_CHARS]
+        trimmed_text = text[: config.MAX_UNIT_CHARS]
         units.append(
             {
                 "name": name,
@@ -746,16 +599,17 @@ def _group_units_into_file_chunks(
         # Fall back to simple chunking of entire file text
         chunks = []
         texts = _chunk_text(
-            full_src, max_chars=FILE_LEVEL_WINDOW_TARGET, overlap=200)
+            full_src, max_chars=config.FILE_LEVEL_WINDOW_TARGET, overlap=200
+        )
         for i, t in enumerate(texts):
             chunks.append((t, i, 1, len(full_src.splitlines())))
         return chunks
 
     # Single chunk if file small enough
-    if len(full_src) <= FILE_LEVEL_MAX_CHARS:
+    if len(full_src) <= config.FILE_LEVEL_MAX_CHARS:
         return [(full_src, 0, 1, len(full_src.splitlines()))]
 
-    # Otherwise group sequential units into chunks up to FILE_LEVEL_WINDOW_TARGET chars
+    # Otherwise group sequential units into chunks up to config.FILE_LEVEL_WINDOW_TARGET chars
     chunks: List[Tuple[str, int, int, int]] = []
     current_parts: List[str] = []
     current_start = units[0]["start_line"]
@@ -782,8 +636,7 @@ def _group_units_into_file_chunks(
             flush(units[i - 1]["end_line"])
             # Start new chunk, optionally overlap previous N functions
             if FILE_LEVEL_OVERLAP_FUNCTIONS > 0 and i > 0:
-                overlap_units = units[max(
-                    0, i - FILE_LEVEL_OVERLAP_FUNCTIONS): i]
+                overlap_units = units[max(0, i - FILE_LEVEL_OVERLAP_FUNCTIONS) : i]
                 for ou in overlap_units:
                     osep = f"\n\n# ---- {ou['type'].upper()} {ou['name']} (lines {ou['start_line']}-{ou['end_line']}) [overlap] ----\n"
                     current_parts.append(osep + ou["code"].rstrip())
@@ -825,8 +678,7 @@ def _write_chunks_manifest(
     dest = Path(persist_dir)
     dest.mkdir(parents=True, exist_ok=True)
 
-    safe_repo = repo_url.replace(
-        "://", "_").replace("/", "_").replace(":", "_")
+    safe_repo = repo_url.replace("://", "_").replace("/", "_").replace(":", "_")
     manifest_name = filename or f"{safe_repo}_embedding_chunks.jsonl"
     manifest_path = dest / manifest_name
 
@@ -864,7 +716,7 @@ def index_repository(
         embedding_mode: Override global embedding mode ("local" or "remote")
     """
     # Use the specified mode or fall back to global setting
-    mode = embedding_mode or EMBEDDING_MODE
+    mode = embedding_mode or config.EMBEDDING_MODE
     print(f"Indexing repository with {mode} embeddings")
 
     status_path = _get_status_path(persist_dir)
@@ -911,21 +763,20 @@ def index_repository(
 
         # --- Embed Summary ---
         try:
-            from myapp.views import (
-                get_summary,
+            from myapp.summar import (
+                generate_or_get_summary,
             )  # Local import to avoid circular dependency
 
-            summary_data = get_summary(repo_url)
-            if summary_data and summary_data.get("summary"):
+            summary_data, commit, _ = generate_or_get_summary(repo_url)
+            if summary_data:
                 print("Embedding repository summary...")
-                summary = summary_data["summary"]
-                for section_id, content in summary.items():
+                for section_id, content in summary_data.items():
                     doc = f"Summary of Section: {section_id}\n\n{content}"
                     texts_to_embed.append(doc)
                     metadata_for_text.append(
                         {
                             "repo_url": repo_url,
-                            "commit": summary_data.get("commit"),
+                            "commit": commit,
                             "file_path": "repository-summary.md",
                             "unit_name": f"Summary: {section_id}",
                             "unit_type": "summary",
@@ -967,8 +818,7 @@ def index_repository(
                         units = _extract_generic_code_units(fp)
                         if not units:
                             units = [_fallback_file_unit(fp)]  # final fallback
-                    rel_path_str = str(fp.relative_to(
-                        tmpdir)).replace("\\", "/")
+                    rel_path_str = str(fp.relative_to(tmpdir)).replace("\\", "/")
                     # Add to repo map
                     try:
                         size_bytes = fp.stat().st_size
@@ -1047,8 +897,7 @@ def index_repository(
                                     "embedding_mode": mode,
                                 }
                             )
-                            log_f.write(
-                                f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
+                            log_f.write(f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
                             continue
                         # Python or large fallback
                         unit_chunks = _chunk_text(u["code"])
@@ -1073,8 +922,7 @@ def index_repository(
                                     "embedding_mode": mode,
                                 }
                             )
-                            log_f.write(
-                                f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
+                            log_f.write(f"--- UNIT-LEVEL DOCUMENT ---\n{doc}\n\n")
 
         if not texts_to_embed:
             statuses[repo_url] = {
@@ -1136,15 +984,8 @@ def index_repository(
         print(f"Embedding log saved to: {log_file_path}")
         # Persist repository map for agent lookup
         try:
-            if hasattr(_repo_map, "_write_repo_map"):
-                _repo_map._write_repo_map(
-                    repo_url, commit, repo_map_files, persist_dir=persist_dir
-                )
-                print("Saved repository map (files & units)")
-            else:
-                print(
-                    "_write_repo_map not available in repo_map module; skipping save."
-                )
+            _write_repo_map(repo_url, commit, repo_map_files, persist_dir=persist_dir)
+            print("Saved repository map (files & units)")
         except Exception as e:
             print(f"Failed to write repository map: {e}")
 
@@ -1197,7 +1038,7 @@ def query_repository(
         embedding_mode: Override global embedding mode ("local" or "remote")
     """
     # Use the specified mode or fall back to global setting
-    mode = embedding_mode or EMBEDDING_MODE
+    mode = embedding_mode or config.EMBEDDING_MODE
 
     try:
         client = chromadb.PersistentClient(path=persist_dir)
@@ -1207,8 +1048,7 @@ def query_repository(
         return []
 
     try:
-        query_embedding = get_embeddings(
-            [question], "RETRIEVAL_QUERY", mode)[0]
+        query_embedding = get_embeddings([question], "RETRIEVAL_QUERY", mode)[0]
     except Exception as e:
         print(f"Failed to embed query: {e}")
         return []
@@ -1232,26 +1072,26 @@ def get_embedding_info() -> Dict:
     Returns information about the current embedding configuration.
     """
     return {
-        "mode": EMBEDDING_MODE,
-        "local_model": LOCAL_EMBEDDING_MODEL,
-        "remote_model": REMOTE_EMBEDDING_MODEL,
-        "device": LOCAL_EMBEDDING_DEVICE,
-        "batch_size": EMBEDDING_BATCH_SIZE,
-        "dimensions": EMBEDDING_DIMENSIONS,
-        "deny_extensions": sorted(list(DENY_EXTENSIONS)),
-        "deny_filenames": sorted(list(DENY_FILENAMES)),
-        "deny_dir_names": sorted(list(DENY_DIR_NAMES)),
-        "max_file_size_bytes": MAX_FILE_SIZE_BYTES,
+        "mode": config.EMBEDDING_MODE,
+        "local_model": config.EMBEDDING_MODEL_NAME_LOCAL,
+        "remote_model": config.REMOTE_EMBEDDING_MODEL,
+        "device": config.LOCAL_EMBEDDING_DEVICE,
+        "batch_size": config.EMBEDDING_BATCH_SIZE,
+        "dimensions": config.EMBEDDING_DIMENSIONS,
+        "deny_extensions": sorted(list(config.DENY_EXTENSIONS)),
+        "deny_filenames": sorted(list(config.DENY_FILENAMES)),
+        "deny_dir_names": sorted(list(config.DENY_DIR_NAMES)),
+        "max_file_size_bytes": config.MAX_FILE_SIZE_BYTES,
         "dual_indexing": {
-            "file_level_max_chars": FILE_LEVEL_MAX_CHARS,
-            "file_level_window_target": FILE_LEVEL_WINDOW_TARGET,
-            "file_level_overlap_functions": FILE_LEVEL_OVERLAP_FUNCTIONS,
+            "file_level_max_chars": config.FILE_LEVEL_MAX_CHARS,
+            "file_level_window_target": config.FILE_LEVEL_WINDOW_TARGET,
+            "file_level_overlap_functions": config.FILE_LEVEL_OVERLAP_FUNCTIONS,
         },
         "retrieval": {
-            "high_level_top_k_files": HIGH_LEVEL_TOP_K_FILES,
-            "high_level_unit_per_file": HIGH_LEVEL_UNIT_PER_FILE,
+            "high_level_top_k_files": config.HIGH_LEVEL_TOP_K_FILES,
+            "high_level_unit_per_file": config.HIGH_LEVEL_UNIT_PER_FILE,
         },
-        "classifier_model": CLASSIFIER_MODEL_NAME,
+        "classifier_model": config.CLASSIFIER_MODEL_NAME,
     }
 
 
@@ -1266,17 +1106,6 @@ _classification_lock = threading.Lock()
 
 
 # Advanced retrieval functions moved entirely to retrieval.py (no shims kept).
-
-
-# =============================
-# Repository Map & Lookup API
-# =============================
-
-# Repo map utilities migrated to repo_map.py. Keep constant for compatibility.
-REPO_MAP_SUFFIX = "_repo_map.json"
-
-
-# Repo map helpers removed; import directly from myapp.repo_map in callers.
 
 
 # Public re-exports for external imports relying on old locations.

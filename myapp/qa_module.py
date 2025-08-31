@@ -21,10 +21,8 @@ from . import embedder  # still used for get_indexing_status (could later move)
 from .retrieval import query_repository_advanced
 from .repo_map import get_repo_map_summary
 from .agent import run_agentic_lookups
-from .summar import get_summary, SECTION_DEFINITIONS
-
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-LLM_MODEL_NAME = "gemini-2.5-flash"
+from .summar import get_summary
+from . import config
 
 
 def _assemble_summary_markdown(cached_summary: Dict[str, Any] | None) -> str | None:
@@ -33,7 +31,9 @@ def _assemble_summary_markdown(cached_summary: Dict[str, Any] | None) -> str | N
     summary_dict = cached_summary["summary"]
     parts = []
     for sid, content in summary_dict.items():
-        title = next((s["title"] for s in SECTION_DEFINITIONS if s["id"] == sid), sid)
+        title = next(
+            (s["title"] for s in config.SECTION_DEFINITIONS if s["id"] == sid), sid
+        )
         parts.append(f"## {title}\n{content}\n")
     return "\n".join(parts)
 
@@ -46,7 +46,7 @@ def answer_question(
     embedding_mode: str | None = None,
     google_api_key: str | None = None,
 ) -> Dict[str, Any]:
-    google_api_key = google_api_key or GOOGLE_API_KEY
+    google_api_key = google_api_key or config.GOOGLE_API_KEY
 
     repo_status_data = embedder.get_indexing_status(repo_url, persist_dir=persist_dir)
     repo_status = repo_status_data.get("status")
@@ -66,7 +66,7 @@ def answer_question(
         repo_url,
         persist_dir=persist_dir,
         collection_name=collection_name,
-        embedding_mode=embedding_mode,
+        embedding_mode=embedding_mode or config.EMBEDDING_MODE,
     )
     retrieved_docs = adv.get("documents", [])
     classification = adv.get("classification")
@@ -109,7 +109,7 @@ def answer_question(
     )
 
     final_llm = ChatGoogleGenerativeAI(
-        model=LLM_MODEL_NAME, google_api_key=google_api_key, temperature=0.4
+        model=config.LLM_MODEL_NAME, google_api_key=google_api_key, temperature=0.4
     )
     answer_prompt = ChatPromptTemplate.from_messages(
         [

@@ -1,0 +1,153 @@
+
+# New import for language-aware splitting
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
+except Exception:  # pragma: no cover - optional dependency errors handled later
+    RecursiveCharacterTextSplitter = None  # type: ignore
+    Language = None  # type: ignore
+
+# --- Configuration ---
+# Embedding Configuration (unit-level and file-level)
+EMBEDDING_MODE = os.environ.get(
+    "EMBEDDING_MODE", "remote")  # "local" or "remote"
+LOCAL_EMBEDDING_MODEL = (
+    "nomic-ai/nomic-embed-text-v1.5"  # Nomic model for local embedding
+)
+REMOTE_EMBEDDING_MODEL = "models/embedding-001"  # Google Gemini model
+EMBEDDING_TASK_TYPE = Literal["RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"]
+EMBEDDING_BATCH_SIZE = 100
+EMBEDDING_DIMENSIONS = 768  # This may vary based on the model
+LOCAL_EMBEDDING_DEVICE = os.environ.get(
+    "LOCAL_EMBEDDING_DEVICE", "cpu"
+)  # "cpu" or "cuda"
+
+# File-level dual indexing configuration
+FILE_LEVEL_MAX_CHARS = int(os.environ.get(
+    "REPO_EXPLAINER_FILE_MAX_CHARS", 8000))
+FILE_LEVEL_WINDOW_TARGET = int(
+    os.environ.get("REPO_EXPLAINER_FILE_WINDOW_CHARS", 4000)
+)  # Target size for windowed file chunks
+FILE_LEVEL_OVERLAP_FUNCTIONS = int(
+    os.environ.get("REPO_EXPLAINER_FILE_OVERLAP_FUNCS", 1)
+)  # Number of functions to overlap between large file windows
+MAX_TOTAL_GROUPED_CONTEXT_CHARS = int(
+    os.environ.get("REPO_EXPLAINER_MAX_TOTAL_GROUPED", 60000)
+)
+
+# Retrieval tuning
+HIGH_LEVEL_TOP_K_FILES = int(os.environ.get("REPO_EXPLAINER_TOP_K_FILES", 8))
+HIGH_LEVEL_UNIT_PER_FILE = int(
+    os.environ.get("REPO_EXPLAINER_UNITS_PER_FILE", 6))
+
+# Classifier model (separate from embedding model so we don't interfere with primary embedding pipeline)
+CLASSIFIER_MODEL_NAME = os.environ.get(
+    "REPO_EXPLAINER_CLASSIFIER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# --- Module-level State Management ---
+STATUS_FILE_NAME = "indexing_status.json"
+_index_lock = threading.Lock()
+
+# --- File exclusion / denylist configuration ---
+# Extensions, filenames and directory names we never want to index
+DENY_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".mp4",
+    ".mp3",
+    ".wav",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".exe",
+    ".dll",
+    ".so",
+    ".pyc",
+    ".class",
+    ".jar",
+    ".pdf",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+}
+
+# Specific file names to always skip
+DENY_FILENAMES = {"db.sqlite3", "thumbs.db"}
+
+# Directory names that are commonly noisy
+DENY_DIR_NAMES = {
+    "node_modules",
+    "venv",
+    ".venv",
+    "env",
+    "build",
+    "dist",
+    "target",
+    "out",
+    "public",
+    "static",
+    "media",
+    "__pycache__",
+    "coverage",
+    "vendor",
+    "bower_components",
+    ".next",
+    ".nuxt",
+    "django_bundles",
+    "django_bundle",
+}
+
+# Max file size (bytes) to consider for indexing (default 200 KB)
+MAX_FILE_SIZE_BYTES = int(os.environ.get(
+    "REPO_EXPLAINER_MAX_FILE_SIZE", 200 * 1024))
+
+# Generic (non-Python) code splitting configuration
+CODE_SPLIT_CHUNK_SIZE = int(
+    os.environ.get("REPO_EXPLAINER_CODE_CHUNK_SIZE", 1800)
+)  # Target characters per chunk
+CODE_SPLIT_CHUNK_OVERLAP = int(
+    os.environ.get("REPO_EXPLAINER_CODE_CHUNK_OVERLAP", 200)
+)  # Character overlap for continuity
+MAX_UNIT_CHARS = int(
+    os.environ.get("REPO_EXPLAINER_MAX_UNIT_CHARS", 6000)
+)  # Hard ceiling safeguard for any single unit (trim/split if exceeded)
+
+# Map file extensions to LangChain Language enum (best-effort; missing entries fallback to custom separators)
+LANG_EXT_MAP = {
+    ".js": "JS",
+    ".ts": "TS",
+    ".jsx": "JS",
+    ".tsx": "TS",
+    ".java": "JAVA",
+    ".go": "GO",
+    ".rs": "RUST",
+    ".php": "PHP",
+    ".rb": "RUBY",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "CPP",
+    ".cc": "CPP",
+    ".hpp": "CPP",
+    ".cs": "CSHARP",
+    ".swift": "SWIFT",
+    ".scala": "SCALA",
+    ".kt": "KOTLIN",
+    ".kts": "KOTLIN",
+    ".html": "HTML",
+    ".htm": "HTML",
+    ".css": "CSS",
+    ".md": "MARKDOWN",
+    ".json": "JSON",
+    ".xml": "XML",
+    ".yml": "YAML",
+    ".yaml": "YAML",
+}
