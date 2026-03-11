@@ -8,7 +8,13 @@ import re
 from urllib.parse import urlparse
 from typing import Optional, List, Dict
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+def _get_github_token() -> Optional[str]:
+    """Read GITHUB_TOKEN from environment at call time (not import time).
+
+    Reading at call time ensures that tokens set after module import (e.g. by
+    Django's dotenv loading or test harnesses) are picked up correctly.
+    """
+    return os.environ.get("GITHUB_TOKEN")
 
 
 def parse_github_url(repo_url: str):
@@ -62,22 +68,23 @@ def fetch_repo_tree(repo_url: str):
 
     Returns a list of blob dictionaries or None on error.
     """
-    if not GITHUB_TOKEN:
+    token = _get_github_token()
+    if not token:
         print("Error: GITHUB_TOKEN environment variable not set.")
         return None
     try:
         owner, repo = parse_github_url(repo_url)
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        headers = {"Authorization": f"token {token}"}
         repo_api = f"https://api.github.com/repos/{owner}/{repo}"
-        repo_info = requests.get(repo_api, headers=headers).json()
+        repo_info = requests.get(repo_api, headers=headers, timeout=15).json()
         default_branch = repo_info.get("default_branch", "main")
         ref_url = f"{repo_api}/git/refs/heads/{default_branch}"
-        ref = requests.get(ref_url, headers=headers).json()
+        ref = requests.get(ref_url, headers=headers, timeout=15).json()
         sha = ref.get("object", {}).get("sha")
         if not sha:
             return None
         tree_url = f"{repo_api}/git/trees/{sha}?recursive=1"
-        tree = requests.get(tree_url, headers=headers).json().get("tree", [])
+        tree = requests.get(tree_url, headers=headers, timeout=30).json().get("tree", [])
         blobs = [item for item in tree if item.get("type") == "blob"]
         print(f"Fetched {len(blobs)} blob paths from GitHub API.")
         return blobs
@@ -88,14 +95,15 @@ def fetch_repo_tree(repo_url: str):
 
 def get_file_content(repo_url: str, relative_file_path: str) -> Optional[str]:
     """Retrieve file content from GitHub (UTF-8 decoded, ignoring errors)."""
-    if not GITHUB_TOKEN:
+    token = _get_github_token()
+    if not token:
         print("Error: GITHUB_TOKEN environment variable is not set.")
         return None
     try:
         owner, repo = parse_github_url(repo_url)
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{relative_file_path.lstrip('/')}"
         headers = {
-            "Authorization": f"token {GITHUB_TOKEN}",
+            "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
         }
         resp = requests.get(api_url, headers=headers, timeout=10)
@@ -119,7 +127,7 @@ def fetch_json(url: str, headers: Dict[str, str]):
     """Thin helper around requests.get().json() to keep _get_latest_commit concise."""
     import requests
 
-    return requests.get(url, headers=headers).json()
+    return requests.get(url, headers=headers, timeout=15).json()
 
 
 def _get_latest_commit(repo_url: str) -> str | None:
@@ -128,11 +136,12 @@ def _get_latest_commit(repo_url: str) -> str | None:
     Used to tie a generated summary to a specific repository state for potential
     staleness detection. Returns None if token missing or any API failure occurs.
     """
-    if not GITHUB_TOKEN:
+    token = _get_github_token()
+    if not token:
         return None  # Anonymous requests would be rate limited / less reliable
     try:
         owner, repo = parse_github_url(repo_url)
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        headers = {"Authorization": f"token {token}"}
         repo_api = f"https://api.github.com/repos/{owner}/{repo}"
         repo_info = fetch_json(repo_api, headers)
         default_branch = repo_info.get("default_branch", "main")

@@ -14,18 +14,11 @@ import threading
 import time
 
 from . import embedder as _embedder  # circular safe for runtime attribute access
+from . import config as _config
 
 LOW_LEVEL_LABEL = "low_level"
 HIGH_LEVEL_LABEL = "high_level"
 _classification_lock = threading.Lock()
-
-# Re-export config values from embedder for cohesion
-MAX_TOTAL_GROUPED_CONTEXT_CHARS = getattr(
-    _embedder, "MAX_TOTAL_GROUPED_CONTEXT_CHARS", 60000
-)
-HIGH_LEVEL_TOP_K_FILES = getattr(_embedder, "HIGH_LEVEL_TOP_K_FILES", 8)
-HIGH_LEVEL_UNIT_PER_FILE = getattr(_embedder, "HIGH_LEVEL_UNIT_PER_FILE", 6)
-EMBEDDING_MODE = getattr(_embedder, "EMBEDDING_MODE", "remote")
 
 
 def classify_question(question: str) -> str:
@@ -145,9 +138,7 @@ def _group_unit_docs(
     If file_docs provided (from high-level stage1) we prepend the first file-level
     chunk for broader context.
     """
-    MAX_TOTAL_GROUPED_CONTEXT_CHARS = getattr(
-        _embedder, "MAX_TOTAL_GROUPED_CONTEXT_CHARS", 60000
-    )
+    MAX_TOTAL_GROUPED_CONTEXT_CHARS = _config.MAX_TOTAL_GROUPED_CONTEXT_CHARS
     files: Dict[str, Dict] = {}
     file_level_map = {}
     if file_docs:
@@ -228,7 +219,7 @@ def query_repository_advanced(
     """
     print("[PIPELINE] Starting advanced retrieval pipeline")
     classification = classify_question(question)
-    mode = embedding_mode or EMBEDDING_MODE
+    mode = embedding_mode or _config.EMBEDDING_MODE
     try:
         import chromadb  # local import to avoid mandatory dependency at import time
 
@@ -269,7 +260,7 @@ def query_repository_advanced(
         collection,
         query_embedding,
         {"repo_url": repo_url, "granularity": "file"},
-        HIGH_LEVEL_TOP_K_FILES,
+        _config.HIGH_LEVEL_TOP_K_FILES,
     )
     if not file_docs:
         print(
@@ -297,7 +288,7 @@ def query_repository_advanced(
             collection,
             query_embedding,
             {"repo_url": repo_url, "granularity": "unit", "file_path": fp},
-            HIGH_LEVEL_UNIT_PER_FILE,
+            _config.HIGH_LEVEL_UNIT_PER_FILE,
         )
         per_file_units.extend(units_for_file)
         print(

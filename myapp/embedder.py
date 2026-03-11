@@ -382,6 +382,37 @@ def _extract_python_units(path: Path) -> List[Dict]:
     return units
 
 
+def _extract_python_top_level_units(path: Path) -> List[Dict]:
+    """Extracts only top-level functions and classes from a Python file.
+
+    Unlike _extract_python_units (which uses ast.walk and returns nested methods too),
+    this only iterates direct children of the module node. This is used for file-level
+    chunking to avoid duplicating method code that is already contained in the parent class.
+    """
+    try:
+        src = path.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(src)
+    except Exception:
+        return []
+
+    units = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = node.lineno
+            end = getattr(node, "end_lineno", start)
+            code = "\n".join(src.splitlines()[start - 1 : end])
+            units.append(
+                {
+                    "name": node.name,
+                    "type": "class" if isinstance(node, ast.ClassDef) else "function",
+                    "start_line": start,
+                    "end_line": end,
+                    "code": code,
+                }
+            )
+    return units
+
+
 def _fallback_file_unit(path: Path) -> Dict:
     """Creates a single 'unit' for an entire file."""
     try:
@@ -597,12 +628,19 @@ def _group_units_into_file_chunks(
 
     if not units:
         # Fall back to simple chunking of entire file text
-        chunks = []
+        total_lines = len(full_src.splitlines())
         texts = _chunk_text(
             full_src, max_chars=config.FILE_LEVEL_WINDOW_TARGET, overlap=200
         )
+        chunks = []
+        stride = config.FILE_LEVEL_WINDOW_TARGET - 200
+        start_char = 0
         for i, t in enumerate(texts):
-            chunks.append((t, i, 1, len(full_src.splitlines())))
+            end_char = start_char + len(t)
+            start_line = full_src.count("\n", 0, start_char) + 1
+            end_line = full_src.count("\n", 0, end_char) + 1
+            chunks.append((t, i, start_line, min(end_line, total_lines)))
+            start_char = max(0, start_char + stride)
         return chunks
 
     # Single chunk if file small enough
@@ -767,7 +805,7 @@ def index_repository(
                 generate_or_get_summary,
             )  # Local import to avoid circular dependency
 
-            summary_data, commit, _ = generate_or_get_summary(repo_url)
+            summary_data, _summary_commit, _ = generate_or_get_summary(repo_url)
             if summary_data:
                 print("Embedding repository summary...")
                 for section_id, content in summary_data.items():
@@ -845,11 +883,15 @@ def index_repository(
                     )
 
                     # --- File-level chunks (granularity=file) ---
-                    # File-level chunks: only use unit boundaries for Python (precise) – for others we still
-                    # window the full file unless it is small. We can later enhance to use generic units too.
-                    file_chunks = _group_units_into_file_chunks(
-                        fp, units if is_python else []
-                    )
+                    # For Python: use only top-level definitions (classes/functions) to avoid
+                    # duplicating method code that is already inside the parent class body.
+                    # For non-Python: use the generic units already extracted (non-overlapping
+                    # code blocks) so file chunks also respect logical code boundaries.
+                    if is_python:
+                        file_level_units = _extract_python_top_level_units(fp)
+                    else:
+                        file_level_units = units
+                    file_chunks = _group_units_into_file_chunks(fp, file_level_units)
                     for fch_text, fch_idx, fch_start, fch_end in file_chunks:
                         doc = (
                             # header

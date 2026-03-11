@@ -201,8 +201,11 @@ def api_ask(request):
     if not question:
         return JsonResponse({"answer": "A question is required."})
 
-    # Allow lightweight reset via natural language prompt
-    if "clear" in question.lower() or "reset" in question.lower():
+    # Allow lightweight reset via explicit command-like phrases only.
+    # Previous substring matching ("clear" in question) caused false positives
+    # for legitimate questions containing those words.
+    _q_stripped = question.lower().strip()
+    if _q_stripped in ("clear", "reset", "clear index", "reset index", "clear indexing", "reset indexing"):
         embedder.clear_indexing_state(repo_url, persist_dir=config.CHROMA_PERSIST_DIR)
         return JsonResponse(
             {
@@ -256,11 +259,9 @@ def api_embedding_config(request):
             if action == "set_mode":
                 new_mode = body.get("mode")
                 if new_mode in ["local", "remote"]:
-                    # Process-level override
+                    # Process-level override: update both env and config module
                     os.environ["EMBEDDING_MODE"] = new_mode
-                    embedder.EMBEDDING_MODE = (
-                        new_mode  # Update module global for runtime
-                    )
+                    config.EMBEDDING_MODE = new_mode
                     return JsonResponse(
                         {
                             "status": "success",

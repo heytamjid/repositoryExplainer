@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /d/Desktop_Projects/repoExplainer/repositoryExplainer/myapp/*.py)"
+    ]
+  }
+}

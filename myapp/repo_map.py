@@ -5,15 +5,15 @@ indexing logic.
 """
 
 from __future__ import annotations
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from pathlib import Path
 import os
 import json
 import time
 from base64 import b64decode
-from urllib.parse import urlparse
 
 from . import embedder as _embedder
+from .github_utils import parse_github_url as _parse_github_url
 
 REPO_MAP_SUFFIX = getattr(_embedder, "REPO_MAP_SUFFIX", "_repo_map.json")
 
@@ -242,17 +242,6 @@ def build_repo_map(
         return repo_map
     except Exception:  # noqa: BLE001
         return None
-
-
-def _parse_github_url(repo_url: str) -> Tuple[str, str]:
-    from urllib.parse import urlparse
-
-    path = urlparse(repo_url).path.rstrip("/")
-    path = path.replace(".git", "")
-    parts = [p for p in path.split("/") if p]
-    if len(parts) < 2:
-        raise ValueError("Invalid GitHub repo URL")
-    return parts[0], parts[1]
 
 
 def _fetch_file_content_github(
