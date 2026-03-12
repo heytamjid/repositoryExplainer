@@ -36,6 +36,48 @@ from .config import (
 
 _index_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Simple SSE progress event system
+# ---------------------------------------------------------------------------
+# Per-repo queue of progress messages consumed by the SSE view.
+# Each entry is a plain string.  A None sentinel signals "stream done".
+import queue as _queue_mod
+
+_progress_queues: Dict[str, list] = {}  # repo_url -> list of Queue objects
+_progress_lock = threading.Lock()
+
+
+def subscribe_progress(repo_url: str) -> "_queue_mod.Queue[Optional[str]]":
+    """Return a new Queue that will receive progress messages for *repo_url*."""
+    q: _queue_mod.Queue[Optional[str]] = _queue_mod.Queue()
+    with _progress_lock:
+        _progress_queues.setdefault(repo_url, []).append(q)
+    return q
+
+
+def unsubscribe_progress(repo_url: str, q: "_queue_mod.Queue") -> None:
+    with _progress_lock:
+        listeners = _progress_queues.get(repo_url, [])
+        if q in listeners:
+            listeners.remove(q)
+
+
+_current_repo = threading.local()  # thread-local for embedding progress
+
+
+def emit_progress(repo_url: str, message: str) -> None:
+    """Broadcast a progress string to every listener for *repo_url*."""
+    with _progress_lock:
+        for q in _progress_queues.get(repo_url, []):
+            q.put(message)
+
+
+def _emit_done(repo_url: str) -> None:
+    """Signal all listeners that the stream is finished."""
+    with _progress_lock:
+        for q in _progress_queues.get(repo_url, []):
+            q.put(None)
+
 
 # Small helper to heuristically detect binary files by sampling the beginning bytes
 def _is_probably_binary(path: Path, sample_size: int = 4096) -> bool:
@@ -215,11 +257,16 @@ def get_embeddings_local(texts: List[str]) -> List[List[float]]:
 
     # Process in batches for memory efficiency
     all_embeddings = []
+    total_batches = (len(texts) + config.EMBEDDING_BATCH_SIZE - 1) // config.EMBEDDING_BATCH_SIZE
     for i in range(0, len(texts), config.EMBEDDING_BATCH_SIZE):
         batch_texts = texts[i : i + config.EMBEDDING_BATCH_SIZE]
+        batch_num = i // config.EMBEDDING_BATCH_SIZE + 1
         print(
-            f"Processing local embedding batch {i // config.EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + config.EMBEDDING_BATCH_SIZE - 1) // config.EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
+            f"Processing local embedding batch {batch_num}/{total_batches} ({len(batch_texts)} items)"
         )
+        repo = getattr(_current_repo, "url", None)
+        if repo:
+            emit_progress(repo, f"Embedding batch {batch_num}/{total_batches}...")
 
         try:
             # Encode the batch
@@ -255,13 +302,18 @@ def get_embeddings_remote(
         raise ValueError("GOOGLE_API_KEY environment variable not set")
 
     all_embeddings = []
+    total_batches = (len(texts) + config.EMBEDDING_BATCH_SIZE - 1) // config.EMBEDDING_BATCH_SIZE
 
     for i in range(0, len(texts), config.EMBEDDING_BATCH_SIZE):
         batch_texts = texts[i : i + config.EMBEDDING_BATCH_SIZE]
+        batch_num = i // config.EMBEDDING_BATCH_SIZE + 1
 
         print(
-            f"Processing remote embedding batch {i // config.EMBEDDING_BATCH_SIZE + 1}/{(len(texts) + config.EMBEDDING_BATCH_SIZE - 1) // config.EMBEDDING_BATCH_SIZE} ({len(batch_texts)} items)"
+            f"Processing remote embedding batch {batch_num}/{total_batches} ({len(batch_texts)} items)"
         )
+        repo = getattr(_current_repo, "url", None)
+        if repo:
+            emit_progress(repo, f"Embedding batch {batch_num}/{total_batches}...")
 
         requests_payload = [
             {
@@ -755,6 +807,7 @@ def index_repository(
     """
     # Use the specified mode or fall back to global setting
     mode = embedding_mode or config.EMBEDDING_MODE
+    _current_repo.url = repo_url  # thread-local for embedding batch progress
     print(f"Indexing repository with {mode} embeddings")
 
     status_path = _get_status_path(persist_dir)
@@ -763,6 +816,8 @@ def index_repository(
 
     if repo_status.get("status") == "done":
         print(f"Repository {repo_url} already indexed. Skipping.")
+        emit_progress(repo_url, "Already indexed.")
+        _emit_done(repo_url)
         return {"status": "already_indexed", "commit": repo_status.get("commit")}
 
     if repo_status.get("status") == "running":
@@ -781,6 +836,7 @@ def index_repository(
     _write_status(status_path, statuses)
 
     # Clean up previous failed attempts for this repo
+    emit_progress(repo_url, "Preparing vector store...")
     try:
         client = chromadb.PersistentClient(path=persist_dir)
         collection = client.get_or_create_collection(collection_name)
@@ -791,15 +847,18 @@ def index_repository(
 
     tmpdir = Path(tempfile.mkdtemp(prefix="repo_index_"))
     try:
+        emit_progress(repo_url, "Cloning repository...")
         commit = _clone_repo(repo_url, tmpdir)
         if not commit:
             raise Exception("Failed to clone repository.")
+        emit_progress(repo_url, f"Cloned (commit {commit[:8]})")
 
         spec = _read_gitignore(tmpdir)
 
         texts_to_embed, metadata_for_text = [], []
 
         # --- Embed Summary ---
+        emit_progress(repo_url, "Generating repository summary...")
         try:
             from myapp.summar import (
                 generate_or_get_summary,
@@ -807,6 +866,7 @@ def index_repository(
 
             summary_data, _summary_commit, _ = generate_or_get_summary(repo_url)
             if summary_data:
+                emit_progress(repo_url, "Embedding summary sections...")
                 print("Embedding repository summary...")
                 for section_id, content in summary_data.items():
                     doc = f"Summary of Section: {section_id}\n\n{content}"
@@ -833,6 +893,7 @@ def index_repository(
         # Accumulate lightweight repository map (paths + unit spans, no code bodies)
         repo_map_files: List[Dict] = []
         with log_file_path.open("w", encoding="utf-8") as log_f:
+            emit_progress(repo_url, "Scanning and parsing files...")
             print("Walking repository files...")
             for root, _, files in os.walk(tmpdir):
                 rootp = Path(root)
@@ -976,6 +1037,7 @@ def index_repository(
             _write_status(status_path, statuses)
             return {"status": "ok", "commit": commit, "indexed_chunks": 0}
 
+        emit_progress(repo_url, f"Embedding {len(texts_to_embed)} chunks ({mode} mode)...")
         print(
             f"Starting to embed {len(texts_to_embed)} text chunks using {mode} embeddings..."
         )
@@ -1016,6 +1078,7 @@ def index_repository(
                 seen_counts[base] = 0
                 ids.append(base)
 
+        emit_progress(repo_url, "Persisting to vector store...")
         collection.add(
             ids=ids,
             documents=texts_to_embed,
@@ -1025,12 +1088,14 @@ def index_repository(
 
         print(f"Embedding log saved to: {log_file_path}")
         # Persist repository map for agent lookup
+        emit_progress(repo_url, "Building repository map...")
         try:
             _write_repo_map(repo_url, commit, repo_map_files, persist_dir=persist_dir)
             print("Saved repository map (files & units)")
         except Exception as e:
             print(f"Failed to write repository map: {e}")
 
+        emit_progress(repo_url, f"Done! Indexed {len(ids)} chunks.")
         statuses[repo_url] = {
             "status": "done",
             "commit": commit,
@@ -1038,6 +1103,7 @@ def index_repository(
             "embedding_mode": mode,
         }
         _write_status(status_path, statuses)
+        _emit_done(repo_url)
 
         return {"status": "ok", "commit": commit, "indexed_chunks": len(ids)}
 
@@ -1052,8 +1118,10 @@ def index_repository(
             print("Partial embeddings cleaned up after failure.")
         except Exception as cleanup_err:
             print(f"Cleanup after failure encountered an error: {cleanup_err}")
+        emit_progress(repo_url, f"Error: {e}")
         statuses[repo_url] = {"status": "failed", "error": str(e)}
         _write_status(status_path, statuses)
+        _emit_done(repo_url)
         return {"status": "error", "message": str(e)}
 
     finally:

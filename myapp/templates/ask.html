@@ -135,7 +135,7 @@
 
     <div id="indexProgress" style="display:none; border:2px solid #000; padding:10px; background:#fff; box-shadow:4px 4px 0 #000; margin-bottom:20px;">
         <strong>Indexing Progress</strong>
-        <div id="indexSteps" style="margin-top:8px; font-size:14px; line-height:1.4;"></div>
+        <div id="indexSteps" style="margin-top:8px; font-size:14px; line-height:1.4; max-height:200px; overflow-y:auto;"></div>
         <div style="margin-top:10px; background:#ddd; height:14px; position:relative;">
             <div id="indexBar" style="background:#00e676; height:100%; width:0%; transition:width .6s;"></div>
         </div>
@@ -171,52 +171,69 @@
         const indexStepsDiv = document.getElementById('indexSteps');
         const indexBar = document.getElementById('indexBar');
 
-        // Simulated step lists (purely cosmetic)
-        const INDEXING_STEPS = [
-            'Cloning repository',
-            'Scanning files',
-            'Parsing code units',
-            'Generating embeddings',
-            'Persisting to vector store',
-            'Building repository map',
-            'It should not take more than 2-5 minutes depending on codebase size... Just know that we are working on it at our limit on the backend.'
+        // Real-time progress via Server-Sent Events
+        let sseSource = null;
+        let sseStepCount = 0;
+
+        // Known pipeline stages for progress bar estimation
+        const STAGE_ORDER = [
+            'Preparing', 'Cloning', 'Generating repository summary',
+            'Embedding summary', 'Scanning', 'Embedding', 'Persisting', 'Building repository map', 'Done'
         ];
 
-        function simulateProgress(stepList, barEl, stepsEl, totalDurationMs=9000) {
-            stepsEl.innerHTML = '';
-            barEl.style.width = '0%';
-            let done = 0;
-            const per = 100 / stepList.length;
-            indexProgress.style.display = 'block';
-            function advance(){
-                if (done >= stepList.length) return;            
-                const step = stepList[done];
-                const line = document.createElement('div');
-                line.textContent = '✔ ' + step;
-                stepsEl.appendChild(line);
-                done++;
-                barEl.style.width = Math.min(done * per, 100) + '%';
-                if (done < stepList.length){
-                    setTimeout(advance, totalDurationMs / stepList.length);
+        function stagePercent(msg) {
+            for (let i = STAGE_ORDER.length - 1; i >= 0; i--) {
+                if (msg.toLowerCase().includes(STAGE_ORDER[i].toLowerCase())) {
+                    return Math.min(((i + 1) / STAGE_ORDER.length) * 100, 100);
                 }
             }
-            setTimeout(advance, 250);
+            // For batch progress like "Embedding batch 3/5..." estimate within embedding stage
+            const batchMatch = msg.match(/batch (\d+)\/(\d+)/);
+            if (batchMatch) {
+                const cur = parseInt(batchMatch[1]), total = parseInt(batchMatch[2]);
+                const embedIdx = STAGE_ORDER.indexOf('Embedding');
+                const base = (embedIdx / STAGE_ORDER.length) * 100;
+                const next = ((embedIdx + 1) / STAGE_ORDER.length) * 100;
+                return base + (cur / total) * (next - base);
+            }
+            return null;
         }
 
-        async function pollIndexStatus(repo){
-            try {
-                const r = await fetch('/api/ask/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'status', repo_url:repo})});
-                if(!r.ok) return;
-                const js = await r.json();
-                if (js.status === 'done') {
-                    const line = document.createElement('div');
-                    line.innerHTML = '<strong>Index complete. You can ask questions now...</strong>';
-                    indexStepsDiv.appendChild(line);
+        function startSSE(repo) {
+            sseStepCount = 0;
+            indexStepsDiv.innerHTML = '';
+            indexBar.style.width = '0%';
+            indexProgress.style.display = 'block';
+
+            if (sseSource) sseSource.close();
+            sseSource = new EventSource('/api/index-progress/?repo_url=' + encodeURIComponent(repo));
+
+            sseSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                const msg = data.msg;
+                sseStepCount++;
+
+                const line = document.createElement('div');
+                const isDone = msg.startsWith('Done!') || msg === 'Already indexed.';
+                const isError = msg.startsWith('Error:');
+                line.innerHTML = (isDone ? '<strong>&#10003; ' + msg + '</strong>' : isError ? '<span style="color:red">&#10007; ' + msg + '</span>' : '&#10003; ' + msg);
+                indexStepsDiv.appendChild(line);
+                indexStepsDiv.scrollTop = indexStepsDiv.scrollHeight;
+
+                // Update progress bar
+                const pct = stagePercent(msg);
+                if (pct !== null) indexBar.style.width = pct + '%';
+                if (isDone) {
                     indexBar.style.width = '100%';
-                } else if (js.status === 'running') {
-                    setTimeout(()=>pollIndexStatus(repo), 2000);
+                    appendMessage('Index complete. You can ask questions now.', 'assistant');
                 }
-            } catch(e){ console.warn('Poll error', e); }
+            };
+
+            sseSource.onerror = function() {
+                // Stream ended (server closed) or real error
+                sseSource.close();
+                sseSource = null;
+            };
         }
 
         function appendMessage(html, cls) {
@@ -243,7 +260,8 @@
                 return;
             }
             appendMessage(`Starting to index ${repoVal}... This may take a few minutes.`, 'assistant');
-        simulateProgress(INDEXING_STEPS, indexBar, indexStepsDiv);
+            // Open SSE stream *before* triggering indexing so we don't miss early events
+            startSSE(repoVal);
             try {
                 const resp = await fetch('/api/ask/', {
                     method: 'POST',
@@ -252,10 +270,7 @@
                 });
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = await resp.json();
-                if (data.status === 'indexing_started') {
-                    appendMessage('Indexing process has begun on the server. You can start asking questions once it is complete.', 'assistant');
-            pollIndexStatus(repoVal);
-                } else {
+                if (data.status !== 'indexing_started') {
                     appendMessage('Could not start indexing. Please check the server logs.', 'assistant');
                 }
             } catch (e) {

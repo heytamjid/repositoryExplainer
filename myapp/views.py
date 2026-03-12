@@ -18,7 +18,7 @@ import json  # JSON request/response handling
 import threading  # For background indexing without blocking HTTP request
 
 from django.shortcuts import render  # Template rendering
-from django.http import JsonResponse, HttpResponseBadRequest  # HTTP responses
+from django.http import JsonResponse, HttpResponseBadRequest, StreamingHttpResponse  # HTTP responses
 from django.views.decorators.csrf import (
     csrf_exempt,
 )  # Allow API POSTs without CSRF token
@@ -328,3 +328,36 @@ def api_embedding_config(request):
 
     else:  # Reject non-GET/POST verbs
         return HttpResponseBadRequest("GET or POST required")
+
+
+def sse_index_progress(request):
+    """Server-Sent Events endpoint for real-time indexing progress.
+
+    GET /api/index-progress/?repo_url=<url>
+    Streams progress events until indexing completes (or 10-min timeout).
+    """
+    repo_url = request.GET.get("repo_url", "").strip()
+    if not repo_url:
+        return HttpResponseBadRequest("repo_url query parameter required")
+
+    q = embedder.subscribe_progress(repo_url)
+
+    def event_stream():
+        import queue as _q
+        try:
+            while True:
+                try:
+                    msg = q.get(timeout=600)  # 10-min max wait
+                except _q.Empty:
+                    yield "data: {\"msg\": \"Timeout waiting for progress.\"}\n\n"
+                    return
+                if msg is None:  # sentinel: stream done
+                    return
+                yield f"data: {json.dumps({'msg': msg})}\n\n"
+        finally:
+            embedder.unsubscribe_progress(repo_url, q)
+
+    resp = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    resp["Cache-Control"] = "no-cache"
+    resp["X-Accel-Buffering"] = "no"
+    return resp

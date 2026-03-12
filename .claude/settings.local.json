@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls -la /d/Desktop_Projects/repoExplainer/repositoryExplainer/myapp/*.py)"
+      "Bash(ls -la /d/Desktop_Projects/repoExplainer/repositoryExplainer/myapp/*.py)",
+      "Bash(cd D:/Desktop_Projects/repoExplainer/repositoryExplainer && python -c \"from myapp import views, embedder, urls; print\\('All imports OK'\\)\")"
     ]
   }
 }
